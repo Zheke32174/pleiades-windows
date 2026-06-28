@@ -14,6 +14,7 @@ forensic brain lives in the container.
 |---|---|
 | `bin/pleiades-collector.ps1` | Reads threat-relevant **AD/Security** events (failed logons 4625, lockouts 4740, Kerberos failures, account/group changes), filters out service-account noise, appends them to the bridge spool. Scheduled task, every 5 min, runs as SYSTEM. |
 | `bin/pleiades-supervisor.ps1` | Keeps WSL + the container alive (boots/self-heals), publishes the Command Deck snapshot, and copies encrypted snapshots offsite. Scheduled task, at logon + every 15 min, runs as the WSL-owning user. |
+| `bin/pleiades-netwatch.ps1` | **Network-layer MITM sensor** — detects gateway-MAC swap (ARP spoof / rogue relay), ARP conflicts, and DNS hijack: the wire-level *effect* of evil twins / stingrays. Sticky baseline; scheduled task every 5 min. See `docs/pleiades-rf-defense-roadmap.md` for the full RF defense plan. |
 | `bin/pleiades-snapshot.sh` | Emits a JSON status snapshot (agent health + ledger integrity + recent signed events) from inside the container. |
 | `portal/pleiades.php` | The **Command Deck** dashboard — drops into the nginx/PHP intranet portal (`C:\xampp\htdocs`), served behind the existing login. |
 | `ops/verify-windows.ps1` | End-to-end Windows-side verification (AD→ledger, deck, backup, self-heal). |
