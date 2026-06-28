@@ -1,0 +1,12 @@
+# Never commit runtime data, secrets, or live event captures.
+spool/
+state/
+backup/
+portal/status.json
+*.enc
+*.sig
+*.key
+escrow.key
+windows-events.log
+collector-cursor.txt
+supervisor.log
