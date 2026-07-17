@@ -1,48 +1,127 @@
-# pleiades-windows
+# Pleiades Windows
 
-The always-on **Windows side** of the Pleiades defensive network — the half that
-keeps the WSL/nspawn swarm fed, alive, and visible. Companion to the in-container
-agents (the [`pleiades`](https://github.com/Zheke32174/pleiades) repo, `lean/`).
+Windows-side sensing, lifecycle coordination, and read-only status publication for the Pleiades defensive system.
 
-The Windows Server DC is always on; WSL may not be. So the system is split by
-availability: sensing + resilience + visibility live on Windows; the signing and
-forensic brain lives in the container.
+This repository is a **host collector and presentation layer**. It does not own the Pleiades trust root, authorize privileged actions, or replace the Linux host's deterministic supervision. The canonical container lifecycle is owned by `pleiades-container.service`; the Windows supervisor only asks that unit to start when WSL returns.
+
+## Current status
+
+Active, pre-production, and being migrated away from the original broad Windows-drive bridge.
+
+The current branch provides:
+
+- replay-safe Windows Security/AD event collection;
+- typed `pleiades.event/v1` JSONL outboxes with stable event IDs;
+- a temporary legacy line spool for compatibility with the current Maia bridge;
+- per-interface gateway and DNS drift sensing with uncertainty labels;
+- overlap-safe scheduled execution through named mutexes;
+- systemd/machinectl lifecycle coordination instead of `boot-tmux.sh`;
+- atomically published `pleiades.status/v1` snapshots;
+- a hardened, read-only PHP Command Deck;
+- verification that exits nonzero when a guarantee fails;
+- destructive recovery tests disabled unless explicitly requested.
+
+The next structural step is an authenticated event-ingestion service. Once that exists, the legacy `C:\pleiades\spool\*.log` bridge can be removed entirely.
 
 ## Components
 
 | File | Role |
 |---|---|
-| `bin/pleiades-collector.ps1` | Reads threat-relevant **AD/Security** events (failed logons 4625, lockouts 4740, Kerberos failures, account/group changes), filters out service-account noise, appends them to the bridge spool. Scheduled task, every 5 min, runs as SYSTEM. |
-| `bin/pleiades-supervisor.ps1` | Keeps WSL + the container alive (boots/self-heals), publishes the Command Deck snapshot, and copies encrypted snapshots offsite. Scheduled task, at logon + every 15 min, runs as the WSL-owning user. |
-| `bin/pleiades-netwatch.ps1` | **Network-layer MITM sensor** — detects gateway-MAC swap (ARP spoof / rogue relay), ARP conflicts, and DNS hijack: the wire-level *effect* of evil twins / stingrays. Sticky baseline; scheduled task every 5 min. See `docs/pleiades-rf-defense-roadmap.md` for the full RF defense plan. |
-| `bin/pleiades-snapshot.sh` | Emits a JSON status snapshot (agent health + ledger integrity + recent signed events) from inside the container. |
-| `portal/pleiades.php` | The **Command Deck** dashboard — drops into the nginx/PHP intranet portal (`C:\xampp\htdocs`), served behind the existing login. |
-| `ops/verify-windows.ps1` | End-to-end Windows-side verification (AD→ledger, deck, backup, self-heal). |
+| `bin/pleiades-collector.ps1` | Collects selected Windows Security/AD events in RecordId order. Writes canonical JSONL and a compatibility spool. |
+| `bin/pleiades-netwatch.ps1` | Maintains sticky per-interface gateway/DNS baselines and emits drift findings as evidence, not automatic containment. |
+| `bin/pleiades-supervisor.ps1` | Starts the canonical Linux systemd unit when necessary, publishes status atomically, and mirrors encrypted snapshots locally. |
+| `bin/pleiades-snapshot.sh` | Queries the registered `pleiades` nspawn machine and emits schema-valid JSON without hand-built escaping. |
+| `portal/pleiades.php` | Read-only Command Deck renderer with strict output escaping and browser security headers. |
+| `ops/verify-windows.ps1` | Static and optional live integration verification. Fails honestly. |
 
 ## Data flow
 
+```text
+Windows Security log ─┐
+                      ├─ host collectors ─▶ typed JSONL outbox
+Gateway/DNS state ────┘                         │
+                                                ├─ temporary legacy compatibility spool
+                                                └─ future authenticated ingestion service
+
+Linux host systemd ─▶ registered Pleiades machine ─▶ signed Nexus ledger
+        │
+        └─ snapshot collector ─▶ atomic status.json ─▶ read-only Command Deck
 ```
-DC Security log ──collector──▶ C:\pleiades\spool\windows-events.log
-                                   │  (read-only bridge: --bind-ro=/mnt/c/pleiades:/host/win)
-                                   ▼
-                           Maia (in container) ──ingest──▶ hash-chained, Ed25519-signed Nexus ledger
-                                   │
-                  supervisor ──snapshot──▶ C:\pleiades\portal\status.json ──▶ pleiades.php (Command Deck)
-                  supervisor ──backup────▶ C:\pleiades\backup\*.enc (encrypted; escrow key NOT copied)
+
+## Runtime layout
+
+Created at install time and intentionally not committed:
+
+```text
+C:\pleiades\
+├── bin\
+├── spool\
+│   ├── windows-events.v1.jsonl
+│   ├── windows-events.log          # temporary compatibility format
+│   ├── netwatch.v1.jsonl
+│   └── netwatch.log                # temporary compatibility format
+├── state\
+│   ├── collector-cursor.txt
+│   ├── netwatch-baseline.v1.json
+│   └── supervisor.log
+├── portal\
+│   └── status.json
+└── backup\                         # local encrypted snapshot mirror only
 ```
 
-If WSL is down, events buffer in the spool and seal when it returns — no blind gap.
+The `backup` directory is **not offsite storage** merely because it is outside the guest. Independent recovery replication belongs on another device or storage provider with separate credentials.
 
-## Runtime layout (created at install; NOT in this repo)
-`C:\pleiades\{spool,state,portal,backup}` hold live event data, cursors, the published
-snapshot, and encrypted backups. None of it is committed — see `.gitignore`.
+## Installation outline
 
-## Install (sketch)
-1. `bin/*` → `C:\pleiades\bin\`; `portal/pleiades.php` → `C:\xampp\htdocs\`.
-2. Register `Pleiades-Collector` (SYSTEM, 5 min) and `Pleiades-Supervisor`
-   (current user, logon + 15 min) scheduled tasks.
-3. Boot the container with `--bind-ro=/mnt/c/pleiades:/host/win`.
+1. Copy `bin/*` to `C:\pleiades\bin\`.
+2. Place `portal/pleiades.php` behind the existing authenticated intranet portal.
+3. Register scheduled tasks:
+   - collector as SYSTEM every five minutes;
+   - netwatch under a network-readable account every five minutes;
+   - supervisor as the WSL-owning user at logon and periodically.
+4. Ensure WSL has the canonical `pleiades-container.service` from [`pleiades-container`](https://github.com/Zheke32174/pleiades-container).
+5. Run static verification before enabling tasks.
 
-> Headless note: the supervisor runs while the operator is logged on (WSL distros are
-> per-user; SYSTEM can't see them). For unattended-reboot recovery, set the task to
-> "run whether logged on or not" yourself (it stores your password).
+```powershell
+pwsh -File .\ops\verify-windows.ps1
+```
+
+For a live integration check:
+
+```powershell
+pwsh -File .\ops\verify-windows.ps1 -Integration
+```
+
+The intentional container-stop recovery test requires a second explicit switch:
+
+```powershell
+pwsh -File .\ops\verify-windows.ps1 -Integration -DestructiveRecoveryTest
+```
+
+## Baselines
+
+Network baselines are sticky. A detected change generates evidence and does not silently become the new normal.
+
+After a verified legitimate network change, remove the baseline deliberately and rerun netwatch:
+
+```powershell
+Remove-Item C:\pleiades\state\netwatch-baseline.v1.json
+pwsh -File C:\pleiades\bin\pleiades-netwatch.ps1
+```
+
+## Security boundary
+
+- Collectors observe and emit evidence; they do not contain or retaliate.
+- The Command Deck reads one validated snapshot and has no control endpoint.
+- The supervisor can request the one canonical Linux unit to start; it does not execute arbitrary model-generated commands.
+- Snapshot mirroring excludes `escrow.key` and fails if that key appears in the mirror.
+- Typed events carry stable IDs so the future gateway can deduplicate at-least-once delivery.
+- The current compatibility spool is temporary and should be replaced by authenticated, durable ingestion.
+
+## Related repositories
+
+- [`pleiades`](https://github.com/Zheke32174/pleiades) — canonical lean runtime and defensive architecture
+- [`pleiades-container`](https://github.com/Zheke32174/pleiades-container) — Gentoo nspawn substrate and host lifecycle
+- [`pleiades-factory-stack`](https://github.com/Zheke32174/pleiades-factory-stack) — research toolchain manifests
+
+MIT — see [LICENSE](LICENSE). Security reports should follow [SECURITY.md](SECURITY.md).
