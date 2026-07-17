@@ -66,7 +66,7 @@ function Publish-Snapshot {
 
   $destination = Join-Path $portalDir 'status.json'
   $temporary = "$destination.tmp.$PID"
-  $raw | Set-Content -Path $temporary -Encoding utf8NoBOM
+  [IO.File]::WriteAllText($temporary, $raw, [Text.UTF8Encoding]::new($false))
   Move-Item -Force $temporary $destination
   Write-Log "snapshot published ($($raw.Length) bytes, ledger=$($parsed.ledger.state))"
 }
@@ -75,7 +75,12 @@ function Mirror-EncryptedSnapshots {
   # This is a local resilience mirror, not an offsite backup. The escrow key is
   # deliberately excluded. Independent/offsite replication belongs to the
   # recovery plane and should use a separate credential and destination.
-  $rootLine = (Invoke-WslBash "set -a; [ -r /etc/pleiades/container.env ] && . /etc/pleiades/container.env; printf '%s' \"${PLEIADES_ROOT:-/var/lib/machines/pleiades}\"") -join ''
+  $rootCommand = @'
+set -a
+[ -r /etc/pleiades/container.env ] && . /etc/pleiades/container.env
+printf '%s' "${PLEIADES_ROOT:-/var/lib/machines/pleiades}"
+'@
+  $rootLine = (Invoke-WslBash $rootCommand) -join ''
   $source = "$rootLine/var/lib/maia/snapshots"
   $copy = @"
 set -euo pipefail
