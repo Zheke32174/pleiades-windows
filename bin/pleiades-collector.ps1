@@ -1,61 +1,179 @@
-# pleiades-collector.ps1 — Windows-side AD/Security sensor for the Pleiades bridge.
-# Emits ONLY high-signal, threat-relevant events (real failed logons, lockouts,
-# Kerberos failures, account/group changes) — aggressively filtering the DC's
-# internal service-account noise. Tokenized lines -> read-only bridge spool ->
-# WSL container ingests -> Maia signs into the Nexus ledger.
+# pleiades-collector.ps1 — Windows Security/AD event collector.
 #
-# Idempotent (RecordId cursor). First run sets a baseline (no historical dump).
+# Emits a canonical JSONL outbox plus the current legacy line spool used by the
+# lean bridge. Cursor advancement occurs only after both writes succeed, giving
+# at-least-once delivery rather than silent loss.
+
 [CmdletBinding()]
-param([string]$Root = 'C:\pleiades', [int]$MaxScan = 250)
+param(
+  [string]$Root = 'C:\pleiades',
+  [ValidateRange(1, 5000)][int]$MaxEvents = 500,
+  [switch]$IncludeServiceNoise
+)
 
 $ErrorActionPreference = 'Stop'
-$spoolDir = Join-Path $Root 'spool'; $stateDir = Join-Path $Root 'state'
+$spoolDir = Join-Path $Root 'spool'
+$stateDir = Join-Path $Root 'state'
 $null = New-Item -ItemType Directory -Force -Path $spoolDir, $stateDir
-$spool   = Join-Path $spoolDir 'windows-events.log'
-$curFile = Join-Path $stateDir 'collector-cursor.txt'
+$legacySpool = Join-Path $spoolDir 'windows-events.log'
+$jsonSpool = Join-Path $spoolDir 'windows-events.v1.jsonl'
+$cursorFile = Join-Path $stateDir 'collector-cursor.txt'
 
-$kind = @{
-  4625='failed_logon';   4740='account_lockout'; 4771='kerberos_preauth_fail'
-  4720='account_created';4722='account_enabled';  4723='password_change'
-  4724='password_reset'; 4725='account_disabled'; 4726='account_deleted'
-  4738='account_changed';4728='member_added_global_grp'
-  4732='member_added_local_grp'; 4756='member_added_univ_grp'
+$mutex = [Threading.Mutex]::new($false, 'Global\PleiadesSecurityCollector')
+if (-not $mutex.WaitOne(0)) {
+  Write-Output 'collector already running; exiting'
+  exit 0
 }
 
-# First run: baseline the cursor to "now" — do not backfill history.
-if (-not (Test-Path $curFile)) {
-  try { $latest = (Get-WinEvent -LogName Security -MaxEvents 1 -ErrorAction Stop).RecordId } catch { $latest = 0 }
-  Set-Content -Path $curFile -Value $latest -Encoding Ascii
-  "baseline set; cursor=$latest (no historical backfill)"; return
+$eventKinds = @{
+  4625 = 'authentication.failure'
+  4740 = 'account.lockout'
+  4771 = 'kerberos.preauth_failure'
+  4720 = 'account.created'
+  4722 = 'account.enabled'
+  4723 = 'account.password_change_attempt'
+  4724 = 'account.password_reset'
+  4725 = 'account.disabled'
+  4726 = 'account.deleted'
+  4738 = 'account.changed'
+  4728 = 'group.member_added.global'
+  4732 = 'group.member_added.local'
+  4756 = 'group.member_added.universal'
 }
-[int64]$cursor = 0; [int64]::TryParse((Get-Content $curFile -Raw).Trim(), [ref]$cursor) | Out-Null
 
-# Internal/service accounts that are noise, not threats — skipped.
-$skipAcct = '\$$|^(ANONYMOUS_LOGON|CLIUSR|UMFD-\d+|DWM-\d+|himds|SYSTEM|LOCAL[_ ]SERVICE|NETWORK[_ ]SERVICE|AADConnectProvisioningAgent|DefaultAccount|-)$|^MSSQL'
+function ConvertTo-SafeString([object]$Value, [int]$Limit = 256) {
+  if ($null -eq $Value -or [string]::IsNullOrWhiteSpace("$Value")) { return $null }
+  $valueText = ("$Value" -replace '[\x00-\x1F\x7F]', '')
+  if ($valueText.Length -gt $Limit) { $valueText = $valueText.Substring(0, $Limit) }
+  return $valueText
+}
 
-function San([object]$v) {
-  if ($null -eq $v -or "$v" -eq '') { return 'none' }
-  $s = ("$v" -replace '[^\x20-\x7E]', '' -replace '\s', '_')
-  if ($s.Length -gt 64) { $s = $s.Substring(0, 64) }
-  if ($s -eq '') { 'none' } else { $s }
+function Add-Utf8Line([string]$Path, [string]$Line) {
+  $encoding = [Text.UTF8Encoding]::new($false)
+  $stream = [IO.FileStream]::new($Path, [IO.FileMode]::Append, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+  try {
+    $writer = [IO.StreamWriter]::new($stream, $encoding)
+    try {
+      $writer.WriteLine($Line)
+      $writer.Flush()
+      $stream.Flush($true)
+    } finally {
+      $writer.Dispose()
+    }
+  } finally {
+    $stream.Dispose()
+  }
 }
 
 try {
-  $evts = Get-WinEvent -FilterHashtable @{ LogName='Security'; Id=@($kind.Keys) } -MaxEvents $MaxScan -ErrorAction Stop |
-            Where-Object { $_.RecordId -gt $cursor } | Sort-Object RecordId
-} catch { if ($_.Exception.Message -match 'No events') { $evts = @() } else { throw } }
+  if (-not (Test-Path $cursorFile)) {
+    try {
+      $latest = (Get-WinEvent -LogName Security -MaxEvents 1 -ErrorAction Stop).RecordId
+    } catch {
+      $latest = 0
+    }
+    Set-Content -Path $cursorFile -Value ([int64]$latest) -Encoding ascii
+    Write-Output "baseline set; cursor=$latest; no historical backfill"
+    exit 0
+  }
 
-$max = $cursor; $n = 0
-foreach ($e in $evts) {
-  if ($e.RecordId -gt $max) { $max = $e.RecordId }
-  $d = @{}
-  try { foreach ($p in ([xml]$e.ToXml()).Event.EventData.Data) { $d[$p.Name] = $p.'#text' } } catch {}
-  $acctRaw = if ($d['TargetUserName']) { $d['TargetUserName'] } else { $d['SubjectUserName'] }
-  if ("$acctRaw" -match $skipAcct) { continue }                       # service/machine noise
-  if ([int]$e.Id -eq 4625 -and ($d['LogonType'] -in '4','5')) { continue }  # batch/service failures
-  $line = "ts=$([int64]([DateTimeOffset]$e.TimeCreated.ToUniversalTime()).ToUnixTimeSeconds()) id=$($e.Id) kind=$($kind[[int]$e.Id]) account=$(San $acctRaw) ip=$(San $d['IpAddress']) ltype=$(San $d['LogonType']) status=$(San $d['Status'])"
-  Add-Content -Path $spool -Value $line -Encoding Ascii
-  $n++
+  [int64]$cursor = 0
+  [void][int64]::TryParse((Get-Content $cursorFile -Raw).Trim(), [ref]$cursor)
+
+  $eventExpression = (@($eventKinds.Keys | Sort-Object) | ForEach-Object { "EventID=$_" }) -join ' or '
+  $xpath = "*[System[(($eventExpression)) and EventRecordID > $cursor]]"
+  try {
+    $events = @(Get-WinEvent -LogName Security -FilterXPath $xpath -Oldest -MaxEvents $MaxEvents -ErrorAction Stop)
+  } catch {
+    if ($_.Exception.Message -match 'No events were found') { $events = @() } else { throw }
+  }
+
+  $serviceAccountPattern = '\$$|^(ANONYMOUS LOGON|CLIUSR|UMFD-\d+|DWM-\d+|himds|SYSTEM|LOCAL SERVICE|NETWORK SERVICE|AADConnectProvisioningAgent|DefaultAccount|-)$|^MSSQL'
+  $written = 0
+  $filtered = 0
+  $maxCommitted = $cursor
+
+  foreach ($event in $events) {
+    $data = @{}
+    try {
+      foreach ($node in ([xml]$event.ToXml()).Event.EventData.Data) {
+        $data[$node.Name] = $node.'#text'
+      }
+    } catch {
+      throw "failed to parse Security event RecordId=$($event.RecordId): $($_.Exception.Message)"
+    }
+
+    $account = if ($data['TargetUserName']) { $data['TargetUserName'] } else { $data['SubjectUserName'] }
+    $isServiceNoise = ("$account" -match $serviceAccountPattern) -or
+      ([int]$event.Id -eq 4625 -and "$($data['LogonType'])" -in '4', '5')
+
+    if ($isServiceNoise -and -not $IncludeServiceNoise) {
+      $filtered++
+      $maxCommitted = [int64]$event.RecordId
+      continue
+    }
+
+    $eventTime = ([DateTimeOffset]$event.TimeCreated.ToUniversalTime()).ToUnixTimeSeconds()
+    $kind = $eventKinds[[int]$event.Id]
+    $severity = if ($event.Id -in 4720, 4724, 4726, 4728, 4732, 4756) { 'high' }
+      elseif ($event.Id -in 4740, 4771) { 'medium' }
+      else { 'low' }
+
+    $record = [ordered]@{
+      schema = 'pleiades.event/v1'
+      event_id = "windows-security/$($event.MachineName)/$($event.RecordId)"
+      event_type = $kind
+      source = [ordered]@{
+        collector = 'pleiades-windows-security'
+        log = 'Security'
+        record_id = [int64]$event.RecordId
+        host = $event.MachineName
+        trust_class = 'host-collected'
+      }
+      observed_at = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+      event_time = [int64]$eventTime
+      severity = $severity
+      subject = [ordered]@{
+        account = ConvertTo-SafeString $account 128
+        domain = ConvertTo-SafeString $data['TargetDomainName'] 128
+      }
+      network = [ordered]@{
+        ip = ConvertTo-SafeString $data['IpAddress'] 128
+        workstation = ConvertTo-SafeString $data['WorkstationName'] 128
+      }
+      details = [ordered]@{
+        windows_event_id = [int]$event.Id
+        logon_type = ConvertTo-SafeString $data['LogonType'] 32
+        status = ConvertTo-SafeString $data['Status'] 64
+        sub_status = ConvertTo-SafeString $data['SubStatus'] 64
+        service_noise = [bool]$isServiceNoise
+      }
+    }
+
+    $json = $record | ConvertTo-Json -Depth 8 -Compress
+    $legacy = "ts=$eventTime rid=$($event.RecordId) id=$($event.Id) kind=$($kind -replace '\.', '_') host=$(ConvertTo-SafeString $event.MachineName 128) account=$(ConvertTo-SafeString $account 128) ip=$(ConvertTo-SafeString $data['IpAddress'] 128) ltype=$(ConvertTo-SafeString $data['LogonType'] 32) status=$(ConvertTo-SafeString $data['Status'] 64)"
+
+    Add-Utf8Line -Path $jsonSpool -Line $json
+    Add-Utf8Line -Path $legacySpool -Line $legacy
+    $maxCommitted = [int64]$event.RecordId
+    Set-Content -Path $cursorFile -Value $maxCommitted -Encoding ascii
+    $written++
+  }
+
+  # Filtered events are intentionally acknowledged only after the whole scan has
+  # completed. If the script fails while writing a retained event, its cursor is
+  # not advanced and the event will be replayed on the next run.
+  if ($events.Count -gt 0 -and $maxCommitted -gt $cursor) {
+    Set-Content -Path $cursorFile -Value $maxCommitted -Encoding ascii
+  }
+
+  $remaining = if ($events.Count -eq $MaxEvents) { 'possible' } else { 'none' }
+  Write-Output "collected=$written filtered=$filtered cursor=$maxCommitted backlog=$remaining"
+  exit 0
+} catch {
+  Write-Error $_
+  exit 1
+} finally {
+  $mutex.ReleaseMutex()
+  $mutex.Dispose()
 }
-Set-Content -Path $curFile -Value $max -Encoding Ascii
-"collected $n new high-signal event(s); scanned to RecordId=$max"
