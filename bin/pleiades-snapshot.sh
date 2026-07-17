@@ -23,6 +23,13 @@ print(json.dumps({
 PY
 }
 
+for command in machinectl systemd-run python3; do
+    command -v "$command" >/dev/null 2>&1 || {
+        echo "pleiades-snapshot: required command not found: $command" >&2
+        exit 1
+    }
+done
+
 state="$(machinectl show "$MACHINE" -p State --value 2>/dev/null || true)"
 case "$state" in
     running|degraded) ;;
@@ -68,6 +75,7 @@ records="$(run_guest /bin/bash -lc 'ledger=/var/lib/maia/nexus/ledger; [ -f "$le
 
 python3 - "$state" "$ledger_state" "$records" "$TMP/agents.jsonl" "$TMP/events.ledger" <<'PY'
 import base64
+import binascii
 import json
 import sys
 import time
@@ -105,7 +113,7 @@ with open(events_path, "r", encoding="utf-8", errors="replace") as handle:
                 "digest": digest,
                 "event": payload[:2048],
             })
-        except (ValueError, base64.binascii.Error):
+        except (ValueError, binascii.Error):
             continue
 
 snapshot = {
