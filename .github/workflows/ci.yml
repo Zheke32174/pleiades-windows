@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse and statically analyze PowerShell
+        shell: pwsh
+        run: |
+          Install-Module PSScriptAnalyzer -Scope CurrentUser -Force
+          $results = Invoke-ScriptAnalyzer -Path bin,ops -Recurse -Severity Error
+          $results | Format-Table -AutoSize | Out-String | Write-Host
+          if ($results.Count -gt 0) { throw "PSScriptAnalyzer found $($results.Count) error(s)" }
+
+      - name: Run repository verification
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "$PWD/.ci-runtime" | Out-Null
+          & ./ops/verify-windows.ps1 -Root "$PWD/.ci-runtime"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Defensive bridge invariants
+        shell: bash
+        run: |
+          set -euo pipefail
+          ! grep -RInE 'boot-tmux|pleiades-analysis|--bind-ro=/mnt/c|ErrorActionPreference[[:space:]]*=[[:space:]]*.[Cc]ontinue' bin ops README.md
+          grep -Fq "schema = 'pleiades.event/v1'" bin/pleiades-collector.ps1
+          grep -Fq "schema = 'pleiades.event/v1'" bin/pleiades-netwatch.ps1
+          grep -Fq 'pleiades.status/v1' bin/pleiades-snapshot.sh
+          grep -Fq 'if ($script:Fail -gt 0) { exit 1 }' ops/verify-windows.ps1
