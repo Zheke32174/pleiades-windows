@@ -1,0 +1,39 @@
+apiVersion: modos.pleiades/v1alpha1
+kind: Component
+metadata:
+  name: pleiades-windows-node-adapter
+  repository: Zheke32174/pleiades-windows
+  visibility: public
+  lifecycle: operational
+  defaultBranch: main
+spec:
+  roles:
+    - windows-node-adapter
+    - event-bridge
+    - local-service-integration
+  authority: local-enforcement
+  inputs:
+    - signed-domain-instructions
+    - windows-service-observations
+    - local-policy-cache
+  outputs:
+    - node-inventory
+    - workload-status
+    - signed-domain-events
+  capabilitiesProvided:
+    - node.windows.observe
+    - workload.windows.service
+    - event.bridge.windows
+  capabilitiesRequired:
+    - host.windows.local
+    - identity.workload.verify
+    - policy.local.read
+    - audit.append
+  dataClasses:
+    - public
+    - internal
+    - evidence
+    - untrusted
+  failurePolicy: degrade-local
+  promotionPolicy: signed-pr
+  notes: Windows remains a sovereign local operating environment; this adapter translates stable MODOS contracts into bounded Windows mechanisms.
