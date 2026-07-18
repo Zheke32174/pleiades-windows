@@ -58,5 +58,10 @@ jobs:
           ! grep -RInE 'boot-tmux|pleiades-analysis|--bind-ro=/mnt/c|ErrorActionPreference[[:space:]]*=[[:space:]]*.[Cc]ontinue' bin ops README.md
           grep -Fq "schema = 'pleiades.event/v1'" bin/pleiades-collector.ps1
           grep -Fq "schema = 'pleiades.event/v1'" bin/pleiades-netwatch.ps1
+          grep -Fq 'pleiades.windows-security-cursor/v1' bin/pleiades-collector.ps1
+          grep -Fq '[switch]$AcceptLogReset' bin/pleiades-collector.ps1
+          grep -Fq 'collection_epoch' bin/pleiades-collector.ps1
+          grep -Fq 'legacy collector cursor is corrupt; refusing implicit replay' bin/pleiades-collector.ps1
+          ! grep -Fq 'Set-Content -Path $cursorFile' bin/pleiades-collector.ps1
           grep -Fq 'pleiades.status/v1' bin/pleiades-snapshot.sh
           grep -Fq 'if ($script:Fail -gt 0) { exit 1 }' ops/verify-windows.ps1
