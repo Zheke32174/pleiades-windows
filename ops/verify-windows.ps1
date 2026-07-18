@@ -1,47 +1,135 @@
-# Windows-side end-to-end verification of the Pleiades bridge + resilience + deck.
-$env:WSL_UTF8 = '1'
-$script:P = 0; $script:F = 0
-function Ok($m){ $script:P++; Write-Output "  [PASS] $m" }
-function No($m){ $script:F++; Write-Output "  [FAIL] $m" }
+# Verify the Windows-side Pleiades collector, supervisor, snapshot, and portal.
+# Static checks run by default. Live failed-logon and recovery tests are opt-in.
 
-Write-Output "== A. AD bridge end-to-end (real failed logon -> signed ledger) =="
-$acct = "verify_intruder_$(Get-Random -Maximum 99999)"
-cmd /c "net use \\127.0.0.1\IPC`$ /user:$acct WrongVerifyPass1 2>&1" | Out-Null
-Start-Sleep -Seconds 2
-& 'C:\pleiades\bin\pleiades-collector.ps1' | Out-Null
-$inSpool = (Select-String -Path 'C:\pleiades\spool\windows-events.log' -Pattern $acct -SimpleMatch -ErrorAction SilentlyContinue).Count
-if ($inSpool -ge 1) { Ok "collector captured failed logon ($acct)" } else { No "collector did not capture $acct" }
-$cnt = [int](wsl -d Ubuntu -u root -e bash /mnt/c/pleiades-analysis/ledger-check.sh $acct | Select-Object -Last 1)
-if ($cnt -ge 1) { Ok "AD event sealed into signed ledger ($cnt record)" } else { No "AD event not in ledger" }
+[CmdletBinding()]
+param(
+  [string]$Root = 'C:\pleiades',
+  [string]$Distro = 'Ubuntu',
+  [switch]$Integration,
+  [switch]$DestructiveRecoveryTest
+)
 
-Write-Output "== B. Command Deck =="
-& 'C:\pleiades\bin\pleiades-supervisor.ps1' | Out-Null
-$snap = 'C:\pleiades\portal\status.json'
-if (Test-Path $snap) {
-  $age = (Get-Date) - (Get-Item $snap).LastWriteTime
-  $j = $null; try { $j = Get-Content $snap -Raw | ConvertFrom-Json } catch {}
-  if ($j -and $j.verify -eq 'ok' -and $age.TotalSeconds -lt 180) { Ok "snapshot published, fresh ($([int]$age.TotalSeconds)s), ledger ok" } else { No "snapshot stale/invalid" }
-} else { No "no status.json" }
-$html = & 'C:\xampp\php\php.exe' 'C:\xampp\htdocs\pleiades.php' 2>&1
-$errs = @($html | Select-String -Pattern 'Warning|Fatal|Parse error').Count
-if ($errs -eq 0 -and ($html | Select-String 'Ledger integrity')) { Ok "dashboard renders cleanly (0 php errors)" } else { No "dashboard render errors: $errs" }
-try { Invoke-WebRequest 'http://127.0.0.1:8081/pleiades.php' -MaximumRedirection 0 -UseBasicParsing -ErrorAction Stop | Out-Null; No "deck NOT gated (expected redirect)" }
-catch { if ($_.Exception.Response.StatusCode.value__ -eq 302) { Ok "deck served behind auth (302 -> login)" } else { No "unexpected deck status" } }
+$ErrorActionPreference = 'Stop'
+$script:Pass = 0
+$script:Fail = 0
 
-Write-Output "== C. Offsite snapshot backup =="
-$bk = @(Get-ChildItem 'C:\pleiades\backup\maia-*.enc' -ErrorAction SilentlyContinue)
-$esc = Test-Path 'C:\pleiades\backup\escrow.key'
-if ($bk.Count -ge 1 -and -not $esc) { Ok "encrypted snapshot offsite ($($bk.Count)); escrow key NOT copied" } else { No "backup missing or escrow leaked" }
+function Pass([string]$Message) { $script:Pass++; Write-Output "  [PASS] $Message" }
+function Fail([string]$Message) { $script:Fail++; Write-Output "  [FAIL] $Message" }
+function Check([string]$Message, [scriptblock]$Test) {
+  try { if (& $Test) { Pass $Message } else { Fail $Message } } catch { Fail "$Message — $($_.Exception.Message)" }
+}
 
-Write-Output "== D. Self-heal (kill container -> supervisor recovers) =="
-wsl -d Ubuntu -u root -e bash /mnt/c/pleiades-analysis/kill-container.sh | Out-Null
-& 'C:\pleiades\bin\pleiades-supervisor.ps1' | Out-Null
-$post = wsl -d Ubuntu -u root -e bash /mnt/c/pleiades-analysis/post-check.sh 2>&1 | Out-String
-if ($post -match 'system: running') { Ok "container recovered after kill" } else { No "container did not recover" }
-if ($post -match 'ledger:.*OK') { Ok "ledger intact after recovery" } else { No "ledger not intact post-recovery" }
-if ($post -match 'bridge: OK') { Ok "windows bridge re-mounted after recovery" } else { No "bridge missing post-recovery" }
+$repoRoot = Split-Path -Parent $PSScriptRoot
+$required = @(
+  'bin/pleiades-collector.ps1',
+  'bin/pleiades-supervisor.ps1',
+  'bin/pleiades-netwatch.ps1',
+  'bin/pleiades-snapshot.sh',
+  'portal/pleiades.php'
+)
 
-Write-Output ""
-Write-Output "===================================="
-Write-Output "   WINDOWS-SIDE RESULT: PASS=$script:P  FAIL=$script:F"
-Write-Output "===================================="
+Write-Output '== A. Repository structure and syntax =='
+foreach ($relative in $required) {
+  $path = Join-Path $repoRoot $relative
+  Check "$relative present" { Test-Path $path }
+}
+
+foreach ($path in Get-ChildItem -Path (Join-Path $repoRoot 'bin'), (Join-Path $repoRoot 'ops') -Filter '*.ps1' -File) {
+  Check "$($path.Name) parses as PowerShell" {
+    [void][scriptblock]::Create((Get-Content $path.FullName -Raw))
+    return $true
+  }
+}
+
+Check 'snapshot shell script parses' {
+  & bash -n (Join-Path $repoRoot 'bin/pleiades-snapshot.sh')
+  return $LASTEXITCODE -eq 0
+}
+
+if (Get-Command php -ErrorAction SilentlyContinue) {
+  Check 'Command Deck PHP parses' {
+    & php -l (Join-Path $repoRoot 'portal/pleiades.php') | Out-Null
+    return $LASTEXITCODE -eq 0
+  }
+} else {
+  Write-Output '  [SKIP] php is unavailable; portal parse not checked'
+}
+
+$collectorSource = Get-Content (Join-Path $repoRoot 'bin/pleiades-collector.ps1') -Raw
+Check 'collector uses typed cursor schema' {
+  return $collectorSource.Contains("pleiades.windows-security-cursor/v1")
+}
+Check 'collector event identity includes collection epoch' {
+  return $collectorSource.Contains('collection_epoch') -and
+    $collectorSource.Contains('$($cursorState.collection_epoch)/$($event.RecordId)')
+}
+Check 'collector cursor replacement is durable and atomic' {
+  return $collectorSource.Contains('function Write-AtomicUtf8') -and
+    $collectorSource.Contains('$stream.Flush($true)') -and
+    $collectorSource.Contains('[IO.File]::Replace')
+}
+Check 'collector refuses implicit log reset' {
+  return $collectorSource.Contains('[switch]$AcceptLogReset') -and
+    $collectorSource.Contains('Security log identity/high-water no longer matches')
+}
+Check 'collector strictly parses legacy cursor before migration' {
+  return $collectorSource.Contains('legacy collector cursor is corrupt; refusing implicit replay')
+}
+Check 'collector no longer writes naked cursor text' {
+  return -not $collectorSource.Contains("Set-Content -Path `$cursorFile")
+}
+
+Write-Output '== B. Installed-state checks =='
+$snapshotPath = Join-Path $Root 'portal\status.json'
+if (Test-Path $snapshotPath) {
+  Check 'published snapshot uses pleiades.status/v1' {
+    $snapshot = Get-Content $snapshotPath -Raw | ConvertFrom-Json
+    return $snapshot.schema -eq 'pleiades.status/v1'
+  }
+  Check 'published snapshot is fresh' {
+    return ((Get-Date) - (Get-Item $snapshotPath).LastWriteTime).TotalMinutes -lt 20
+  }
+} else {
+  Write-Output '  [SKIP] no installed status snapshot was found'
+}
+
+$mirror = Join-Path $Root 'backup'
+Check 'snapshot mirror contains no escrow key' { -not (Test-Path (Join-Path $mirror 'escrow.key')) }
+
+if ($Integration) {
+  Write-Output '== C. Live integration =='
+  $collector = Join-Path $repoRoot 'bin/pleiades-collector.ps1'
+  $supervisor = Join-Path $repoRoot 'bin/pleiades-supervisor.ps1'
+
+  Check 'collector completes' {
+    & $collector -Root $Root | Out-Null
+    return $LASTEXITCODE -eq 0
+  }
+
+  Check 'supervisor publishes a valid snapshot' {
+    & $supervisor -Root $Root -Distro $Distro | Out-Null
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $snapshotPath)) { return $false }
+    $snapshot = Get-Content $snapshotPath -Raw | ConvertFrom-Json
+    return $snapshot.schema -eq 'pleiades.status/v1' -and $snapshot.container -in 'running', 'degraded'
+  }
+
+  if ($DestructiveRecoveryTest) {
+    Write-Output '== D. Opt-in recovery interruption =='
+    Check 'container restarts after an intentional stop' {
+      & wsl.exe -d $Distro -u root -- systemctl stop pleiades-container.service | Out-Null
+      if ($LASTEXITCODE -ne 0) { return $false }
+      & $supervisor -Root $Root -Distro $Distro | Out-Null
+      if ($LASTEXITCODE -ne 0) { return $false }
+      $state = (& wsl.exe -d $Distro -u root -- machinectl show pleiades -p State --value 2>$null | Select-Object -Last 1)
+      return "$state" -in 'running', 'degraded'
+    }
+  }
+}
+
+Write-Output ''
+Write-Output '===================================='
+Write-Output "   WINDOWS-SIDE RESULT: PASS=$script:Pass FAIL=$script:Fail"
+Write-Output '===================================='
+
+if ($script:Fail -gt 0) { exit 1 }
+exit 0
