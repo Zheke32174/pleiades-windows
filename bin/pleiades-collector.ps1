@@ -8,7 +8,8 @@
 param(
   [string]$Root = 'C:\pleiades',
   [ValidateRange(1, 5000)][int]$MaxEvents = 500,
-  [switch]$IncludeServiceNoise
+  [switch]$IncludeServiceNoise,
+  [switch]$AcceptLogReset
 )
 
 $ErrorActionPreference = 'Stop'
@@ -17,10 +18,14 @@ $stateDir = Join-Path $Root 'state'
 $null = New-Item -ItemType Directory -Force -Path $spoolDir, $stateDir
 $legacySpool = Join-Path $spoolDir 'windows-events.log'
 $jsonSpool = Join-Path $spoolDir 'windows-events.v1.jsonl'
-$cursorFile = Join-Path $stateDir 'collector-cursor.txt'
+$cursorFile = Join-Path $stateDir 'collector-cursor.v1.json'
+$legacyCursorFile = Join-Path $stateDir 'collector-cursor.txt'
+$cursorSchema = 'pleiades.windows-security-cursor/v1'
+$currentHost = [Environment]::MachineName
 
 $mutex = [Threading.Mutex]::new($false, 'Global\PleiadesSecurityCollector')
 if (-not $mutex.WaitOne(0)) {
+  $mutex.Dispose()
   Write-Output 'collector already running; exiting'
   exit 0
 }
@@ -65,20 +70,158 @@ function Add-Utf8Line([string]$Path, [string]$Line) {
   }
 }
 
-try {
-  if (-not (Test-Path $cursorFile)) {
-    try {
-      $latest = (Get-WinEvent -LogName Security -MaxEvents 1 -ErrorAction Stop).RecordId
-    } catch {
-      $latest = 0
+function Write-AtomicUtf8([string]$Path, [string]$Text) {
+  $directory = Split-Path -Parent $Path
+  $name = Split-Path -Leaf $Path
+  $temporary = Join-Path $directory ".$name.tmp.$PID.$([Guid]::NewGuid().ToString('N'))"
+  $encoding = [Text.UTF8Encoding]::new($false)
+  $bytes = $encoding.GetBytes($Text)
+  $stream = [IO.FileStream]::new(
+    $temporary,
+    [IO.FileMode]::CreateNew,
+    [IO.FileAccess]::Write,
+    [IO.FileShare]::None
+  )
+  try {
+    $stream.Write($bytes, 0, $bytes.Length)
+    $stream.Flush($true)
+  } finally {
+    $stream.Dispose()
+  }
+  try {
+    if (Test-Path -LiteralPath $Path) {
+      [IO.File]::Replace($temporary, $Path, $null, $true)
+    } else {
+      [IO.File]::Move($temporary, $Path)
     }
-    Set-Content -Path $cursorFile -Value ([int64]$latest) -Encoding ascii
-    Write-Output "baseline set; cursor=$latest; no historical backfill"
-    exit 0
+  } catch {
+    Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
+    throw
+  }
+}
+
+function New-CursorState([int64]$RecordId) {
+  return [pscustomobject][ordered]@{
+    schema = $cursorSchema
+    log = 'Security'
+    host = $currentHost
+    collection_epoch = [Guid]::NewGuid().ToString('D')
+    record_id = $RecordId
+    updated_at = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+  }
+}
+
+function Save-CursorState([object]$Cursor, [int64]$RecordId) {
+  $value = [ordered]@{
+    schema = $cursorSchema
+    log = 'Security'
+    host = "$($Cursor.host)"
+    collection_epoch = "$($Cursor.collection_epoch)"
+    record_id = $RecordId
+    updated_at = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+  }
+  Write-AtomicUtf8 -Path $cursorFile -Text (($value | ConvertTo-Json -Compress) + "`n")
+  return [pscustomobject]$value
+}
+
+function Read-CursorState {
+  if (-not (Test-Path -LiteralPath $cursorFile)) { return $null }
+  try {
+    $value = Get-Content -LiteralPath $cursorFile -Raw -Encoding utf8 | ConvertFrom-Json
+  } catch {
+    throw "collector cursor is unreadable: $($_.Exception.Message)"
   }
 
-  [int64]$cursor = 0
-  [void][int64]::TryParse((Get-Content $cursorFile -Raw).Trim(), [ref]$cursor)
+  $expectedFields = @('collection_epoch', 'host', 'log', 'record_id', 'schema', 'updated_at')
+  $actualFields = @($value.PSObject.Properties.Name | Sort-Object)
+  if (@(Compare-Object $expectedFields $actualFields).Count -ne 0) {
+    throw 'collector cursor has unknown or missing fields'
+  }
+  if ($value.schema -ne $cursorSchema -or $value.log -ne 'Security') {
+    throw "collector cursor schema/log mismatch"
+  }
+  $epoch = [Guid]::Empty
+  if (-not [Guid]::TryParse("$($value.collection_epoch)", [ref]$epoch)) {
+    throw 'collector cursor collection_epoch is invalid'
+  }
+  [int64]$recordId = 0
+  if (-not [int64]::TryParse("$($value.record_id)", [ref]$recordId) -or $recordId -lt 0) {
+    throw 'collector cursor record_id is invalid'
+  }
+  [int64]$updatedAt = 0
+  if (-not [int64]::TryParse("$($value.updated_at)", [ref]$updatedAt) -or $updatedAt -lt 0) {
+    throw 'collector cursor updated_at is invalid'
+  }
+  if ([string]::IsNullOrWhiteSpace("$($value.host)")) {
+    throw 'collector cursor host is invalid'
+  }
+  return [pscustomobject][ordered]@{
+    schema = $cursorSchema
+    log = 'Security'
+    host = "$($value.host)"
+    collection_epoch = $epoch.ToString('D')
+    record_id = $recordId
+    updated_at = $updatedAt
+  }
+}
+
+function Get-SecurityHighWater {
+  try {
+    $latest = Get-WinEvent -LogName Security -MaxEvents 1 -ErrorAction Stop
+    return [int64]$latest.RecordId
+  } catch {
+    if ($_.Exception.Message -match 'No events were found') { return [int64]0 }
+    throw "cannot read Security log high-water mark: $($_.Exception.Message)"
+  }
+}
+
+function Initialize-CursorState {
+  $cursor = Read-CursorState
+  if ($null -ne $cursor) { return $cursor }
+
+  if (Test-Path -LiteralPath $legacyCursorFile) {
+    [int64]$legacyRecordId = 0
+    $legacyRaw = (Get-Content -LiteralPath $legacyCursorFile -Raw -Encoding ascii).Trim()
+    if (-not [int64]::TryParse($legacyRaw, [ref]$legacyRecordId) -or $legacyRecordId -lt 0) {
+      throw 'legacy collector cursor is corrupt; refusing implicit replay'
+    }
+    $cursor = New-CursorState -RecordId $legacyRecordId
+    $cursor = Save-CursorState -Cursor $cursor -RecordId $legacyRecordId
+    $migrated = "$legacyCursorFile.migrated.$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())"
+    Move-Item -LiteralPath $legacyCursorFile -Destination $migrated -Force
+    Write-Output "legacy cursor migrated; cursor=$legacyRecordId epoch=$($cursor.collection_epoch)"
+    return $cursor
+  }
+
+  $latest = Get-SecurityHighWater
+  $cursor = New-CursorState -RecordId $latest
+  $cursor = Save-CursorState -Cursor $cursor -RecordId $latest
+  Write-Output "baseline set; cursor=$latest epoch=$($cursor.collection_epoch); no historical backfill"
+  return $cursor
+}
+
+try {
+  $cursorState = Initialize-CursorState
+  [int64]$cursor = $cursorState.record_id
+  $latestRecordId = Get-SecurityHighWater
+  $epochInvalid = ($cursorState.host -ne $currentHost) -or ($latestRecordId -lt $cursor)
+  if ($epochInvalid) {
+    if (-not $AcceptLogReset) {
+      throw (
+        "Security log identity/high-water no longer matches the saved cursor " +
+        "(saved_host=$($cursorState.host) current_host=$currentHost " +
+        "cursor=$cursor latest=$latestRecordId). Re-run with -AcceptLogReset " +
+        "only after reviewing the log reset or host replacement."
+      )
+    }
+    $cursorState = New-CursorState -RecordId $latestRecordId
+    $cursorState = Save-CursorState -Cursor $cursorState -RecordId $latestRecordId
+    Write-Output (
+      "collection epoch reset; cursor=$latestRecordId " +
+      "epoch=$($cursorState.collection_epoch); no historical backfill"
+    )
+    exit 0
+  }
 
   $eventExpression = (@($eventKinds.Keys | Sort-Object) | ForEach-Object { "EventID=$_" }) -join ' or '
   $xpath = "*[System[(($eventExpression)) and EventRecordID > $cursor]]"
@@ -121,11 +264,12 @@ try {
 
     $record = [ordered]@{
       schema = 'pleiades.event/v1'
-      event_id = "windows-security/$($event.MachineName)/$($event.RecordId)"
+      event_id = "windows-security/$($event.MachineName)/$($cursorState.collection_epoch)/$($event.RecordId)"
       event_type = $kind
       source = [ordered]@{
         collector = 'pleiades-windows-security'
         log = 'Security'
+        collection_epoch = $cursorState.collection_epoch
         record_id = [int64]$event.RecordId
         host = $event.MachineName
         trust_class = 'host-collected'
@@ -151,24 +295,27 @@ try {
     }
 
     $json = $record | ConvertTo-Json -Depth 8 -Compress
-    $legacy = "ts=$eventTime rid=$($event.RecordId) id=$($event.Id) kind=$($kind -replace '\.', '_') host=$(ConvertTo-SafeString $event.MachineName 128) account=$(ConvertTo-SafeString $account 128) ip=$(ConvertTo-SafeString $data['IpAddress'] 128) ltype=$(ConvertTo-SafeString $data['LogonType'] 32) status=$(ConvertTo-SafeString $data['Status'] 64)"
+    $legacy = "ts=$eventTime rid=$($event.RecordId) epoch=$($cursorState.collection_epoch) id=$($event.Id) kind=$($kind -replace '\.', '_') host=$(ConvertTo-SafeString $event.MachineName 128) account=$(ConvertTo-SafeString $account 128) ip=$(ConvertTo-SafeString $data['IpAddress'] 128) ltype=$(ConvertTo-SafeString $data['LogonType'] 32) status=$(ConvertTo-SafeString $data['Status'] 64)"
 
     Add-Utf8Line -Path $jsonSpool -Line $json
     Add-Utf8Line -Path $legacySpool -Line $legacy
     $maxCommitted = [int64]$event.RecordId
-    Set-Content -Path $cursorFile -Value $maxCommitted -Encoding ascii
+    $cursorState = Save-CursorState -Cursor $cursorState -RecordId $maxCommitted
     $written++
   }
 
   # Filtered events are intentionally acknowledged only after the whole scan has
   # completed. If the script fails while writing a retained event, its cursor is
   # not advanced and the event will be replayed on the next run.
-  if ($events.Count -gt 0 -and $maxCommitted -gt $cursor) {
-    Set-Content -Path $cursorFile -Value $maxCommitted -Encoding ascii
+  if ($events.Count -gt 0 -and $maxCommitted -gt $cursorState.record_id) {
+    $cursorState = Save-CursorState -Cursor $cursorState -RecordId $maxCommitted
   }
 
   $remaining = if ($events.Count -eq $MaxEvents) { 'possible' } else { 'none' }
-  Write-Output "collected=$written filtered=$filtered cursor=$maxCommitted backlog=$remaining"
+  Write-Output (
+    "collected=$written filtered=$filtered cursor=$($cursorState.record_id) " +
+    "epoch=$($cursorState.collection_epoch) backlog=$remaining"
+  )
   exit 0
 } catch {
   Write-Error $_
