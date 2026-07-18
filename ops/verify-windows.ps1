@@ -55,6 +55,30 @@ if (Get-Command php -ErrorAction SilentlyContinue) {
   Write-Output '  [SKIP] php is unavailable; portal parse not checked'
 }
 
+$collectorSource = Get-Content (Join-Path $repoRoot 'bin/pleiades-collector.ps1') -Raw
+Check 'collector uses typed cursor schema' {
+  return $collectorSource.Contains("pleiades.windows-security-cursor/v1")
+}
+Check 'collector event identity includes collection epoch' {
+  return $collectorSource.Contains('collection_epoch') -and
+    $collectorSource.Contains('$($cursorState.collection_epoch)/$($event.RecordId)')
+}
+Check 'collector cursor replacement is durable and atomic' {
+  return $collectorSource.Contains('function Write-AtomicUtf8') -and
+    $collectorSource.Contains('$stream.Flush($true)') -and
+    $collectorSource.Contains('[IO.File]::Replace')
+}
+Check 'collector refuses implicit log reset' {
+  return $collectorSource.Contains('[switch]$AcceptLogReset') -and
+    $collectorSource.Contains('Security log identity/high-water no longer matches')
+}
+Check 'collector strictly parses legacy cursor before migration' {
+  return $collectorSource.Contains('legacy collector cursor is corrupt; refusing implicit replay')
+}
+Check 'collector no longer writes naked cursor text' {
+  return -not $collectorSource.Contains("Set-Content -Path `$cursorFile")
+}
+
 Write-Output '== B. Installed-state checks =='
 $snapshotPath = Join-Path $Root 'portal\status.json'
 if (Test-Path $snapshotPath) {
