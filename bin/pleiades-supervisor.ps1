@@ -108,9 +108,8 @@ function Get-ContainerRoot {
 }
 
 function Get-ContainerState {
-  $unitState = Invoke-WslTyped \
-    -Arguments @('systemctl', 'is-active', '--quiet', $CanonicalUnit) \
-    -AllowedExitCodes @(0, 3, 4)
+  $unitArguments = @('systemctl', 'is-active', '--quiet', $CanonicalUnit)
+  $unitState = Invoke-WslTyped -Arguments $unitArguments -AllowedExitCodes @(0, 3, 4)
   if ($unitState.ExitCode -eq 3) { return 'inactive' }
   if ($unitState.ExitCode -eq 4) {
     throw "canonical unit is unknown to systemd: $CanonicalUnit"
