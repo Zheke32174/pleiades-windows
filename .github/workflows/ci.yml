@@ -58,11 +58,14 @@ jobs:
             Install-Module PSScriptAnalyzer -RequiredVersion 1.24.0 -Scope CurrentUser -Force -AllowClobber
             Import-Module PSScriptAnalyzer -RequiredVersion 1.24.0 -Force
             "PSScriptAnalyzer 1.24.0" | Set-Content -LiteralPath psscriptanalyzer-version.txt -Encoding utf8
-            $errorFindings = @(Invoke-ScriptAnalyzer -Path bin,ops -Recurse -Severity Error)
-            $warningFindings = @(Invoke-ScriptAnalyzer -Path bin,ops -Recurse -Severity Warning)
+            $targets = @(Get-ChildItem bin,ops -Recurse -Filter '*.ps1' -File | Sort-Object FullName)
+            foreach ($target in $targets) {
+              $errorFindings += @(Invoke-ScriptAnalyzer -Path $target.FullName -Severity Error)
+              $warningFindings += @(Invoke-ScriptAnalyzer -Path $target.FullName -Severity Warning)
+            }
           } catch {
             $status = 1
-            "PSScriptAnalyzer setup or execution failed: $($_.Exception.Message)" | Set-Content -LiteralPath psscriptanalyzer-errors.txt -Encoding utf8
+            ($_ | Format-List * -Force | Out-String) | Set-Content -LiteralPath psscriptanalyzer-errors.txt -Encoding utf8
           }
           if ($errorFindings.Count -gt 0) {
             $status = 1
@@ -83,10 +86,17 @@ jobs:
         id: repository
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path "$PWD/.ci-runtime" | Out-Null
-          & ./ops/verify-windows.ps1 -Root "$PWD/.ci-runtime" *> repository-verification.log
-          $status = $LASTEXITCODE
-          Get-Content repository-verification.log | Write-Host
+          $status = 0
+          try {
+            New-Item -ItemType Directory -Force -Path "$PWD/.ci-runtime" | Out-Null
+            & ./ops/verify-windows.ps1 -Root "$PWD/.ci-runtime" *>&1 |
+              Tee-Object -FilePath repository-verification.log | Write-Host
+            if ($LASTEXITCODE -ne 0) { $status = $LASTEXITCODE }
+          } catch {
+            $status = 1
+            ($_ | Format-List * -Force | Out-String) | Add-Content -LiteralPath repository-verification.log -Encoding utf8
+          }
+          if (Test-Path repository-verification.log) { Get-Content repository-verification.log | Write-Host }
           "status=$status" >> $env:GITHUB_OUTPUT
           exit 0
 
@@ -94,9 +104,16 @@ jobs:
         id: install
         shell: pwsh
         run: |
-          & ./ops/test-install-windows.ps1 *> install-contract-tests.log
-          $status = $LASTEXITCODE
-          Get-Content install-contract-tests.log | Write-Host
+          $status = 0
+          try {
+            & ./ops/test-install-windows.ps1 *>&1 |
+              Tee-Object -FilePath install-contract-tests.log | Write-Host
+            if ($LASTEXITCODE -ne 0) { $status = $LASTEXITCODE }
+          } catch {
+            $status = 1
+            ($_ | Format-List * -Force | Out-String) | Set-Content -LiteralPath install-contract-tests.log -Encoding utf8
+          }
+          if (Test-Path install-contract-tests.log) { Get-Content install-contract-tests.log | Write-Host }
           "status=$status" >> $env:GITHUB_OUTPUT
           exit 0
 
