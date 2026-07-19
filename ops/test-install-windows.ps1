@@ -36,9 +36,11 @@ try {
 
   foreach ($entry in @($receipt.managed_files)) {
     $path = Join-Path $testRoot ("$($entry.path)" -replace '/', '\')
+    $receiptHash = "$($entry.sha256)"
+    Assert ($receiptHash -match '^[0-9a-f]{64}$') "managed receipt hash is not one scalar SHA-256: $path"
     Assert (Test-Path -LiteralPath $path -PathType Leaf) "managed file missing: $path"
     $hash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
-    Assert ($hash -eq "$($entry.sha256)") "managed hash mismatch: $path"
+    Assert ($hash -eq $receiptHash) "managed hash mismatch: $path"
   }
 
   & $installer -InstallRoot $testRoot | Out-Null
