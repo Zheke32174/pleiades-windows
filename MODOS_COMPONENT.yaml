@@ -1,0 +1,53 @@
+apiVersion: modos.pleiades/v1alpha1
+kind: Component
+metadata:
+  name: pleiades-windows-node-adapter
+  repository: Zheke32174/pleiades-windows
+  visibility: public
+  lifecycle: experimental
+  defaultBranch: main
+spec:
+  roles:
+    - windows-host-observer
+    - evidence-outbox
+    - read-only-status-publisher
+    - bounded-wsl-lifecycle-coordinator
+  authority: local-enforcement
+  inputs:
+    - windows-security-events
+    - windows-network-configuration
+    - local-collector-state
+    - registered-linux-unit-status
+    - local-status-snapshot
+  outputs:
+    - typed-windows-observation-events
+    - network-drift-evidence
+    - local-status-snapshot
+    - local-encrypted-snapshot-mirror
+    - bounded-linux-unit-start-request
+  capabilitiesProvided:
+    - node.windows.observe
+    - event.outbox.windows
+    - status.windows.render.readonly
+    - workload.linux.registered-unit.start
+  capabilitiesRequired:
+    - host.windows.eventlog.read
+    - host.windows.network.read
+    - host.windows.scheduled-task
+    - filesystem.local.private-state
+    - wsl.root.systemd.registered-unit
+  dataClasses:
+    - public
+    - private
+    - internal
+    - evidence
+    - untrusted
+  failurePolicy: degrade-local
+  promotionPolicy: evidence-gated
+  notes: >-
+    This pre-production adapter observes local Windows state, emits unsigned
+    typed outboxes, renders one validated snapshot, and may request exactly one
+    configured Linux systemd unit to start through WSL. It does not accept
+    arbitrary model commands, verify signed domain instructions, enforce
+    network containment, sign emitted events, own the Pleiades trust root, or
+    promote its own evidence.
