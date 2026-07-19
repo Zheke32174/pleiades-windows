@@ -16,7 +16,7 @@ $TaskNames = @(
 )
 
 function Write-Plan([string]$Message) {
-  if ($DryRun) { Write-Output "[dry-run] $Message" } else { Write-Output $Message }
+  if ($DryRun) { Write-Host "[dry-run] $Message" } else { Write-Host $Message }
 }
 
 function Test-Administrator {
