@@ -1,0 +1,103 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  publish-source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          show-progress: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Verify immutable release identity
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="$(tr -d '[:space:]' < VERSION)"
+          test "$TAG" = "v$version"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git diff --quiet
+          git diff --cached --quiet
+          git rev-parse --verify "refs/tags/$TAG"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release identity already exists and will not be edited: $TAG" >&2
+            exit 1
+          fi
+
+      - name: Build exact tagged source package
+        run: python3 scripts/package_release.py --output dist
+
+      - name: Verify checksums and receipt
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum -c SHA256SUMS.txt
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+
+          version = pathlib.Path('../VERSION').read_text(encoding='utf-8').strip()
+          receipt = json.loads(pathlib.Path(f'pleiades-windows-{version}.build-receipt.json').read_text(encoding='utf-8'))
+          assert receipt['version'] == version
+          assert receipt['commit'] == os.environ['GITHUB_SHA']
+          assert receipt['distribution'] == 'unsigned-source'
+          assert receipt['scripts_authenticode_signed'] is False
+          assert receipt['contains_runtime_state'] is False
+          assert receipt['contains_event_records'] is False
+          assert receipt['contains_credentials'] is False
+          assert receipt['tasks_registered_by_package_build'] is False
+          PY
+
+      - name: Write download-first release notes
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          cat > RELEASE_NOTES.md <<EOF
+          # pleiades-windows ${TAG}
+
+          Download **pleiades-windows-${version}.zip** and verify it against **SHA256SUMS.txt** before extraction.
+
+          This release is a deterministic package of reviewed, unsigned source. It is not an MSI/MSIX, Authenticode-signed binary distribution, WSL distribution, container image, web server, credential bundle, event-data export, or automatically activated service.
+
+          Verification assets:
+
+          - pleiades-windows-${version}.spdx.json
+          - pleiades-windows-${version}.build-receipt.json
+          - SHA256SUMS.txt
+
+          Read README.md before installation. Run the installer with -DryRun first. Scheduled-task registration is a separate explicit elevated action and does not start the tasks.
+          EOF
+
+      - name: Create release once
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          gh release create "$TAG" \
+            "dist/pleiades-windows-${version}.zip" \
+            "dist/pleiades-windows-${version}.spdx.json" \
+            "dist/pleiades-windows-${version}.build-receipt.json" \
+            "dist/SHA256SUMS.txt" \
+            --verify-tag \
+            --title "pleiades-windows ${TAG}" \
+            --notes-file RELEASE_NOTES.md
