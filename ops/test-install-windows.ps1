@@ -6,6 +6,7 @@ $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $installer = Join-Path $PSScriptRoot 'install-windows.ps1'
 $uninstaller = Join-Path $PSScriptRoot 'uninstall-windows.ps1'
+$supervisor = Join-Path $repoRoot 'bin\pleiades-supervisor.ps1'
 $testRoot = Join-Path ([IO.Path]::GetTempPath()) ("pleiades-windows-test-" + [Guid]::NewGuid().ToString('N'))
 
 function Assert([bool]$Condition, [string]$Message) {
@@ -23,6 +24,42 @@ function Expect-Failure([scriptblock]$Action, [string]$Pattern) {
 }
 
 try {
+  # Lifecycle identity is validated before dry-run planning or filesystem mutation.
+  Expect-Failure {
+    & $installer -InstallRoot $testRoot -Distro "Ubuntu';touch injected;#" -DryRun | Out-Null
+  } 'bounded non-shell identifier'
+  Expect-Failure {
+    & $installer -InstallRoot $testRoot -Machine "pleiades';touch injected;#" -DryRun | Out-Null
+  } 'Machine must be exactly pleiades'
+  Expect-Failure {
+    & $installer -InstallRoot $testRoot -Unit 'other.service' -DryRun | Out-Null
+  } 'Unit must be exactly pleiades-container.service'
+  Assert (-not (Test-Path -LiteralPath $testRoot)) 'invalid lifecycle configuration created the install root'
+
+  & $supervisor -Root $testRoot -Distro Ubuntu -ValidateConfigurationOnly | Out-Null
+  Expect-Failure {
+    & $supervisor -Root $testRoot -Distro 'Ubuntu$(touch-injected)' -ValidateConfigurationOnly | Out-Null
+  } 'bounded non-shell identifier'
+  Expect-Failure {
+    & $supervisor -Root $testRoot -Machine other -ValidateConfigurationOnly | Out-Null
+  } 'Machine must be exactly pleiades'
+  Expect-Failure {
+    & $supervisor -Root $testRoot -Unit other.service -ValidateConfigurationOnly | Out-Null
+  } 'Unit must be exactly pleiades-container.service'
+  Assert (-not (Test-Path -LiteralPath $testRoot)) 'configuration-only validation created runtime directories'
+
+  $supervisorSource = Get-Content -LiteralPath $supervisor -Raw
+  Assert (-not $supervisorSource.Contains('bash -lc')) 'supervisor still constructs bash -lc command strings'
+  Assert ($supervisorSource.Contains('function Invoke-WslTyped')) 'typed WSL invocation helper missing'
+  Assert ($supervisorSource.Contains("'wslpath', '-a', '-u', `$Root")) 'supervisor does not derive bridge path from installed Root'
+  Assert (-not $supervisorSource.Contains('. /etc/pleiades/container.env')) 'supervisor still sources container.env as shell code'
+
+  $installerSource = Get-Content -LiteralPath $installer -Raw
+  $supervisorArgumentLine = @($installerSource -split "`n" | Where-Object { $_ -match '^\s*\$supervisorArgs\s*=' })
+  Assert ($supervisorArgumentLine.Count -eq 1) 'installer must define one supervisor task argument line'
+  Assert (-not $supervisorArgumentLine[0].Contains('-Machine')) 'scheduled supervisor task forwards mutable machine identity'
+  Assert (-not $supervisorArgumentLine[0].Contains('-Unit')) 'scheduled supervisor task forwards mutable unit identity'
+
   & $installer -InstallRoot $testRoot -DryRun | Out-Null
   Assert (-not (Test-Path -LiteralPath $testRoot)) 'dry run created the install root'
 
@@ -32,6 +69,8 @@ try {
   $receipt = Get-Content -LiteralPath $receiptPath -Raw -Encoding utf8 | ConvertFrom-Json
   Assert ($receipt.schema -eq 'pleiades.windows-install-receipt/v1') 'unexpected install receipt schema'
   Assert ($receipt.tasks_registered -eq $false) 'tasks registered without explicit switch'
+  Assert ($receipt.machine -eq 'pleiades') 'receipt machine identity is not canonical'
+  Assert ($receipt.unit -eq 'pleiades-container.service') 'receipt unit identity is not canonical'
   Assert (@($receipt.managed_files).Count -ge 8) 'managed file receipt is incomplete'
 
   foreach ($entry in @($receipt.managed_files)) {
@@ -76,7 +115,7 @@ try {
   & $uninstaller -InstallRoot $testRoot -PurgeData -Yes | Out-Null
   Assert (-not (Test-Path -LiteralPath $testRoot)) 'confirmed purge did not remove test root'
 
-  Write-Output 'PASS: Windows install, update, uninstall, preservation, and purge contracts'
+  Write-Output 'PASS: Windows lifecycle configuration, install, update, uninstall, preservation, and purge contracts'
 } finally {
   if (Test-Path -LiteralPath $testRoot) {
     Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue
