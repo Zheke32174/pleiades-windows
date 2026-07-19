@@ -30,7 +30,7 @@ $ManagedFiles = @(
 )
 
 function Write-Plan([string]$Message) {
-  if ($DryRun) { Write-Output "[dry-run] $Message" } else { Write-Output $Message }
+  if ($DryRun) { Write-Host "[dry-run] $Message" } else { Write-Host $Message }
 }
 
 function Test-Administrator {
@@ -169,7 +169,8 @@ $installed = @()
 foreach ($relative in $ManagedFiles) {
   $source = Join-Path $repoRoot $relative
   $destination = Join-Path $InstallRoot $relative
-  $hash = Copy-ManagedFile -Source $source -Destination $destination -BackupRoot $backupRoot
+  [string]$hash = Copy-ManagedFile -Source $source -Destination $destination -BackupRoot $backupRoot
+  if ($hash -notmatch '^[0-9a-f]{64}$') { throw "managed file hash is malformed: $relative" }
   $installed += [ordered]@{ path = ($relative -replace '\\', '/'); sha256 = $hash }
 }
 
