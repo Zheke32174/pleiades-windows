@@ -116,8 +116,9 @@ Check 'supervisor validates exact snapshot object and field shapes before public
   return $supervisorSource.Contains('snapshot top level must be exactly one JSON object') -and
     $supervisorSource.Contains('snapshot schema must be the exact bounded scalar') -and
     $supervisorSource.Contains('snapshot ledger must be exactly one object') -and
-    $supervisorSource.Contains('snapshot agents must be an array') -and
-    $supervisorSource.Contains('snapshot events must be an array')
+    $supervisorSource.Contains("foreach (`$field in 'agents', 'events')") -and
+    $supervisorSource.Contains('snapshot $field must be an array') -and
+    $supervisorSource.Contains('snapshot $field entries must be objects')
 }
 Check 'supervisor passes mirror paths as argv to fixed script logic' {
   return $supervisorSource.Contains('function Invoke-WslScript') -and
