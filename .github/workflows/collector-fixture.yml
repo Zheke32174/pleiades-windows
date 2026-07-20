@@ -1,0 +1,38 @@
+name: Windows collector fixture
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cursor-epochs:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse fixture PowerShell
+        shell: pwsh
+        run: |
+          $failures = @()
+          foreach ($path in @(
+            'ops/collector-fixture-wrapper.ps1',
+            'ops/test-collector-baseline.ps1',
+            'ops/test-collector-replay.ps1'
+          )) {
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path $path), [ref]$tokens, [ref]$errors
+            )
+            foreach ($item in @($errors)) { $failures += "$path: $($item.Message)" }
+          }
+          if ($failures.Count -gt 0) { throw ($failures -join "`n") }
+      - name: Run baseline migration and reset fixture
+        shell: pwsh
+        run: ./ops/test-collector-baseline.ps1
+      - name: Run cursor failure and replay fixture
+        shell: pwsh
+        run: ./ops/test-collector-replay.ps1
