@@ -7,8 +7,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$script:FixtureRoot = $Root
-$script:FixtureEvents = @(
+$global:PleiadesFixtureRoot = $Root
+$global:PleiadesFixtureEvents = @(
   [pscustomobject]@{
     record_id = 10
     event_id = 4625
@@ -28,9 +28,10 @@ $script:FixtureEvents = @(
     }
   }
 )
-$script:StateBroken = $false
+$global:PleiadesFixtureStateBroken = $false
+$global:PleiadesFixtureBreakState = [bool]$BreakStateOnQuery
 
-function New-FixtureEvent([object]$Item) {
+function global:New-PleiadesFixtureEvent([object]$Item) {
   [int64]$recordId = $Item.record_id
   $event = [pscustomobject]@{
     RecordId = $recordId
@@ -60,7 +61,7 @@ function global:Get-WinEvent {
   )
 
   if ($LogName -ne 'Security') { throw "unexpected log: $LogName" }
-  $events = @($script:FixtureEvents | ForEach-Object { New-FixtureEvent $_ } | Sort-Object RecordId)
+  $events = @($global:PleiadesFixtureEvents | ForEach-Object { New-PleiadesFixtureEvent $_ } | Sort-Object RecordId)
 
   if ([string]::IsNullOrWhiteSpace($FilterXPath)) {
     if ($events.Count -eq 0) { throw 'No events were found' }
@@ -71,11 +72,11 @@ function global:Get-WinEvent {
   }
   [int64]$cursor = $Matches[1]
 
-  if ($BreakStateOnQuery -and -not $script:StateBroken) {
-    $state = Join-Path $script:FixtureRoot 'state'
+  if ($global:PleiadesFixtureBreakState -and -not $global:PleiadesFixtureStateBroken) {
+    $state = Join-Path $global:PleiadesFixtureRoot 'state'
     Move-Item -LiteralPath $state -Destination "$state.hold"
     Set-Content -LiteralPath $state -Value 'fixture-blocks-cursor-directory' -Encoding ascii
-    $script:StateBroken = $true
+    $global:PleiadesFixtureStateBroken = $true
   }
 
   $selected = @($events | Where-Object { $_.RecordId -gt $cursor } | Select-Object -First $MaxEvents)
