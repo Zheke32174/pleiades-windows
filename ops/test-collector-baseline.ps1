@@ -14,13 +14,15 @@ try{
     $a=@('-NoProfile','-File',$wrapper,'-Collector',$collector,'-Root',$Root)
     if($Reset){$a+='-AcceptLogReset'}
     $output=@(& pwsh @a 2>&1);$code=$LASTEXITCODE
-    if($code -ne 0){Write-Host ($output -join "`n")}
+    if($output.Count -gt 0){Write-Host ($output -join "`n")}
     $code
   }
 
   $base=Join-Path $temp baseline
   Assert ((Run $base)-eq 0) 'initial baseline succeeds'
-  Assert ((ReadJson (Join-Path $base state/collector-cursor.v1.json)).record_id -eq 11) 'baseline records high-water'
+  $baselineCursor=ReadJson (Join-Path $base state/collector-cursor.v1.json)
+  Write-Host ("baseline cursor: " + ($baselineCursor|ConvertTo-Json -Compress))
+  Assert ($baselineCursor.record_id -eq 11) 'baseline records high-water'
   Assert (!(Test-Path (Join-Path $base spool/windows-events.v1.jsonl))) 'baseline does not backfill'
 
   $legacy=Join-Path $temp legacy;New-Item -ItemType Directory -Force (Join-Path $legacy state)|Out-Null
