@@ -30,9 +30,53 @@ jobs:
             foreach ($item in @($errors)) { $failures += "${path}: $($item.Message)" }
           }
           if ($failures.Count -gt 0) { throw ($failures -join "`n") }
-      - name: Run baseline migration and reset fixture
+      - name: Capture baseline migration and reset fixture
+        id: baseline
         shell: pwsh
-        run: ./ops/test-collector-baseline.ps1
-      - name: Run cursor failure and replay fixture
+        run: |
+          $status = 0
+          try {
+            & ./ops/test-collector-baseline.ps1 *>&1 |
+              Tee-Object -FilePath collector-baseline.log | Write-Host
+            if ($LASTEXITCODE -ne 0) { $status = $LASTEXITCODE }
+          } catch {
+            $status = 1
+            ($_ | Format-List * -Force | Out-String) |
+              Add-Content -LiteralPath collector-baseline.log -Encoding utf8
+          }
+          Get-Content collector-baseline.log | Write-Host
+          "status=$status" >> $env:GITHUB_OUTPUT
+          exit 0
+      - name: Capture cursor failure and replay fixture
+        id: replay
         shell: pwsh
-        run: ./ops/test-collector-replay.ps1
+        run: |
+          $status = 0
+          try {
+            & ./ops/test-collector-replay.ps1 *>&1 |
+              Tee-Object -FilePath collector-replay.log | Write-Host
+            if ($LASTEXITCODE -ne 0) { $status = $LASTEXITCODE }
+          } catch {
+            $status = 1
+            ($_ | Format-List * -Force | Out-String) |
+              Add-Content -LiteralPath collector-replay.log -Encoding utf8
+          }
+          Get-Content collector-replay.log | Write-Host
+          "status=$status" >> $env:GITHUB_OUTPUT
+          exit 0
+      - name: Preserve collector diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-collector-fixture-${{ github.sha }}
+          path: |
+            collector-baseline.log
+            collector-replay.log
+          if-no-files-found: error
+          retention-days: 14
+      - name: Enforce collector fixture result
+        if: always()
+        shell: pwsh
+        run: |
+          if ('${{ steps.baseline.outputs.status }}' -ne '0') { throw 'baseline/reset fixture failed' }
+          if ('${{ steps.replay.outputs.status }}' -ne '0') { throw 'cursor/replay fixture failed' }
