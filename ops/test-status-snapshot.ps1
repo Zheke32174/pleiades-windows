@@ -1,6 +1,9 @@
 # Adversarial contract tests for the Windows status snapshot consumer.
 [CmdletBinding()]
-param()
+param(
+  [ValidateSet('all','valid-running','valid-down','extra-top','extra-ledger','extra-event','bad-digest','duplicate-sequence','oversized-agent','floating-agent','down-with-evidence','state-mismatch','duplicate-key','invalid-validation-mode')]
+  [string]$Case = 'all'
+)
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot
@@ -51,102 +54,80 @@ function Running-Snapshot {
       }
     )
     events = @(
-      [ordered]@{
-        seq = 1
-        timestamp = 1699999999
-        digest = ('a' * 64)
-        event = 'first event'
-      },
-      [ordered]@{
-        seq = 2
-        timestamp = 1700000000
-        digest = ('b' * 64)
-        event = 'second event'
-      }
+      [ordered]@{ seq = 1; timestamp = 1699999999; digest = ('a' * 64); event = 'first event' },
+      [ordered]@{ seq = 2; timestamp = 1700000000; digest = ('b' * 64); event = 'second event' }
     )
   }
 }
 
-try {
-  Expect-Valid (Running-Snapshot) 'running'
-  Expect-Valid ([ordered]@{
-    schema = 'pleiades.status/v1'
-    container = 'down'
-    timestamp = 1700000000
-    ledger = [ordered]@{ state = 'UNKNOWN'; records = 0 }
-    agents = @()
-    events = @()
-  }) 'down'
-
-  $value = Running-Snapshot
-  $value.extra = 'ambient'
-  Expect-Failure {
-    & $supervisor -Root $testRoot -ValidateSnapshotJson (Compact-Json $value) | Out-Null
-  } 'snapshot must contain exactly'
-
-  $value = Running-Snapshot
-  $value.ledger.extra = 1
-  Expect-Failure {
-    & $supervisor -Root $testRoot -ValidateSnapshotJson (Compact-Json $value) | Out-Null
-  } 'snapshot.ledger must contain exactly'
-
-  $value = Running-Snapshot
-  $value.events[0].extra = 'ambient'
-  Expect-Failure {
-    & $supervisor -Root $testRoot -ValidateSnapshotJson (Compact-Json $value) | Out-Null
-  } 'snapshot.events[] must contain exactly'
-
-  $value = Running-Snapshot
-  $value.events[0].digest = 'not-a-digest'
-  Expect-Failure {
-    & $supervisor -Root $testRoot -ValidateSnapshotJson (Compact-Json $value) | Out-Null
-  } 'lowercase SHA-256'
-
-  $value = Running-Snapshot
-  $value.events[1].seq = 1
-  Expect-Failure {
-    & $supervisor -Root $testRoot -ValidateSnapshotJson (Compact-Json $value) | Out-Null
-  } 'strictly increasing unique'
-
-  $value = Running-Snapshot
-  $value.agents[0].detail.message = 'x' * 4097
-  Expect-Failure {
-    & $supervisor -Root $testRoot -ValidateSnapshotJson (Compact-Json $value) | Out-Null
-  } 'oversized or unsupported string'
-
-  $value = Running-Snapshot
-  $value.agents[0].score = 0.5
-  Expect-Failure {
-    & $supervisor -Root $testRoot -ValidateSnapshotJson (Compact-Json $value) | Out-Null
-  } 'floating-point identity'
-
-  $downWithEvidence = [ordered]@{
-    schema = 'pleiades.status/v1'
-    container = 'down'
-    timestamp = 1700000000
-    ledger = [ordered]@{ state = 'UNKNOWN'; records = 0 }
-    agents = @([ordered]@{ agent = 'ghost'; status = 'healthy' })
-    events = @()
+function Invoke-Case([string]$Name) {
+  Write-Output "CASE: $Name"
+  switch ($Name) {
+    'valid-running' { Expect-Valid (Running-Snapshot) 'running' }
+    'valid-down' {
+      Expect-Valid ([ordered]@{
+        schema = 'pleiades.status/v1'; container = 'down'; timestamp = 1700000000
+        ledger = [ordered]@{ state = 'UNKNOWN'; records = 0 }; agents = @(); events = @()
+      }) 'down'
+    }
+    'extra-top' {
+      $value = Running-Snapshot; $value.extra = 'ambient'
+      Expect-Failure { & $supervisor -Root $testRoot -ValidateSnapshotJson (Compact-Json $value) | Out-Null } 'snapshot must contain exactly'
+    }
+    'extra-ledger' {
+      $value = Running-Snapshot; $value.ledger.extra = 1
+      Expect-Failure { & $supervisor -Root $testRoot -ValidateSnapshotJson (Compact-Json $value) | Out-Null } 'snapshot.ledger must contain exactly'
+    }
+    'extra-event' {
+      $value = Running-Snapshot; $value.events[0].extra = 'ambient'
+      Expect-Failure { & $supervisor -Root $testRoot -ValidateSnapshotJson (Compact-Json $value) | Out-Null } 'snapshot.events[] must contain exactly'
+    }
+    'bad-digest' {
+      $value = Running-Snapshot; $value.events[0].digest = 'not-a-digest'
+      Expect-Failure { & $supervisor -Root $testRoot -ValidateSnapshotJson (Compact-Json $value) | Out-Null } 'lowercase SHA-256'
+    }
+    'duplicate-sequence' {
+      $value = Running-Snapshot; $value.events[1].seq = 1
+      Expect-Failure { & $supervisor -Root $testRoot -ValidateSnapshotJson (Compact-Json $value) | Out-Null } 'strictly increasing unique'
+    }
+    'oversized-agent' {
+      $value = Running-Snapshot; $value.agents[0].detail.message = 'x' * 4097
+      Expect-Failure { & $supervisor -Root $testRoot -ValidateSnapshotJson (Compact-Json $value) | Out-Null } 'oversized or unsupported string'
+    }
+    'floating-agent' {
+      $value = Running-Snapshot; $value.agents[0].score = 0.5
+      Expect-Failure { & $supervisor -Root $testRoot -ValidateSnapshotJson (Compact-Json $value) | Out-Null } 'floating-point identity'
+    }
+    'down-with-evidence' {
+      $value = [ordered]@{
+        schema = 'pleiades.status/v1'; container = 'down'; timestamp = 1700000000
+        ledger = [ordered]@{ state = 'UNKNOWN'; records = 0 }
+        agents = @([ordered]@{ agent = 'ghost'; status = 'healthy' }); events = @()
+      }
+      Expect-Failure { & $supervisor -Root $testRoot -ValidateSnapshotJson (Compact-Json $value) | Out-Null } 'down snapshot must contain'
+    }
+    'state-mismatch' {
+      Expect-Failure { & $supervisor -Root $testRoot -ValidateSnapshotJson (Compact-Json (Running-Snapshot)) -ExpectedSnapshotContainerState degraded | Out-Null } 'disagrees with independently observed state'
+    }
+    'duplicate-key' {
+      $duplicate = '{"schema":"pleiades.status/v1","schema":"pleiades.status/v1","container":"running","timestamp":1700000000,"ledger":{"state":"VALID","records":0},"agents":[],"events":[]}'
+      Expect-Failure { & $supervisor -Root $testRoot -ValidateSnapshotJson $duplicate | Out-Null } 'duplicate property'
+    }
+    'invalid-validation-mode' {
+      Expect-Failure { & $supervisor -Root $testRoot -ExpectedSnapshotContainerState running -ValidateConfigurationOnly | Out-Null } 'valid only with ValidateSnapshotJson'
+    }
+    default { throw "unknown test case: $Name" }
   }
-  Expect-Failure {
-    & $supervisor -Root $testRoot -ValidateSnapshotJson (Compact-Json $downWithEvidence) | Out-Null
-  } 'down snapshot must contain'
+  Assert (-not (Test-Path -LiteralPath $testRoot)) "$Name created runtime directories"
+  Write-Output "PASS: $Name"
+}
 
-  Expect-Failure {
-    & $supervisor -Root $testRoot -ValidateSnapshotJson (Compact-Json (Running-Snapshot)) -ExpectedSnapshotContainerState degraded | Out-Null
-  } 'disagrees with independently observed state'
+$cases = @('valid-running','valid-down','extra-top','extra-ledger','extra-event','bad-digest','duplicate-sequence','oversized-agent','floating-agent','down-with-evidence','state-mismatch','duplicate-key','invalid-validation-mode')
 
-  $duplicate = '{"schema":"pleiades.status/v1","schema":"pleiades.status/v1","container":"running","timestamp":1700000000,"ledger":{"state":"VALID","records":0},"agents":[],"events":[]}'
-  Expect-Failure {
-    & $supervisor -Root $testRoot -ValidateSnapshotJson $duplicate | Out-Null
-  } 'duplicate property'
-
-  Expect-Failure {
-    & $supervisor -Root $testRoot -ExpectedSnapshotContainerState running -ValidateConfigurationOnly | Out-Null
-  } 'valid only with ValidateSnapshotJson'
-
-  Assert (-not (Test-Path -LiteralPath $testRoot)) 'validation-only paths created runtime directories'
-  Write-Output 'PASS: exact status object, duplicate-key, event, agent, down-state, and independent-state contracts'
+try {
+  if ($Case -eq 'all') { foreach ($name in $cases) { Invoke-Case $name } }
+  else { Invoke-Case $Case }
+  Write-Output 'PASS: exact status snapshot contract'
 } finally {
   if (Test-Path -LiteralPath $testRoot) {
     Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue
