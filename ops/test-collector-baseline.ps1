@@ -17,7 +17,10 @@ try{
   )|ConvertTo-Json -Depth 7|Set-Content $fixture -Encoding utf8
   function Run([string]$Root,[switch]$Reset){
     $a=@('-NoProfile','-File',$wrapper,'-Collector',$collector,'-Root',$Root,'-Fixture',$fixture)
-    if($Reset){$a+='-AcceptLogReset'};& pwsh @a *> $null;$LASTEXITCODE
+    if($Reset){$a+='-AcceptLogReset'}
+    $output=@(& pwsh @a 2>&1);$code=$LASTEXITCODE
+    if($code -ne 0){Write-Host ($output -join "`n")}
+    $code
   }
 
   $base=Join-Path $temp baseline
