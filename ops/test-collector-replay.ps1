@@ -10,14 +10,11 @@ $collector=(Resolve-Path $Collector).Path;$wrapper=(Resolve-Path $Wrapper).Path
 $temp=Join-Path ([IO.Path]::GetTempPath()) "pleiades-replay-$([guid]::NewGuid().ToString('N'))"
 New-Item -ItemType Directory -Force $temp|Out-Null
 try{
-  $fixture=Join-Path $temp events.json
-  @(
-    @{record_id=10;event_id=4625;machine=[Environment]::MachineName;time='2026-07-19T12:00:00Z';data=@{TargetUserName='alice';TargetDomainName='P';IpAddress='192.0.2.10';WorkstationName='a';LogonType='3';Status='x';SubStatus='y'}},
-    @{record_id=11;event_id=4720;machine=[Environment]::MachineName;time='2026-07-19T12:01:00Z';data=@{TargetUserName='bob';TargetDomainName='P';IpAddress='-';WorkstationName='b';LogonType='-';Status='-';SubStatus='-'}}
-  )|ConvertTo-Json -Depth 7|Set-Content $fixture -Encoding utf8
   function Run([string]$Root,[switch]$Break){
-    $a=@('-NoProfile','-File',$wrapper,'-Collector',$collector,'-Root',$Root,'-Fixture',$fixture)
-    if($Break){$a+='-BreakStateOnQuery'};& pwsh @a *> $null;$code=$LASTEXITCODE
+    $a=@('-NoProfile','-File',$wrapper,'-Collector',$collector,'-Root',$Root)
+    if($Break){$a+='-BreakStateOnQuery'}
+    $output=@(& pwsh @a 2>&1);$code=$LASTEXITCODE
+    if($code -ne 0 -and -not $Break){Write-Host ($output -join "`n")}
     if($Break){$state=Join-Path $Root state;if(Test-Path $state -PathType Leaf){Remove-Item $state};if(Test-Path "$state.hold"){Move-Item "$state.hold" $state}}
     $code
   }
