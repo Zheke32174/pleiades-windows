@@ -1,0 +1,82 @@
+name: Validate exact status snapshot
+
+on:
+  pull_request:
+    paths:
+      - 'bin/pleiades-supervisor.ps1'
+      - 'bin/pleiades-snapshot.sh'
+      - 'ops/test-status-snapshot.ps1'
+      - '.github/workflows/status-contract.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'bin/pleiades-supervisor.ps1'
+      - 'bin/pleiades-snapshot.sh'
+      - 'ops/test-status-snapshot.ps1'
+      - '.github/workflows/status-contract.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pleiades-windows-status-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  status-case:
+    name: status-${{ matrix.case }}
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        case:
+          - valid-running
+          - valid-down
+          - extra-top
+          - extra-ledger
+          - extra-event
+          - bad-digest
+          - duplicate-sequence
+          - oversized-agent
+          - floating-agent
+          - down-with-evidence
+          - state-mismatch
+          - duplicate-key
+          - invalid-validation-mode
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - name: Parse PowerShell status surfaces
+        shell: pwsh
+        run: |
+          $failures = @()
+          foreach ($path in 'bin/pleiades-supervisor.ps1','ops/test-status-snapshot.ps1') {
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path -LiteralPath $path),
+              [ref]$tokens,
+              [ref]$errors
+            )
+            foreach ($errorItem in @($errors)) {
+              $failures += "$path`:$($errorItem.Extent.StartLineNumber): $($errorItem.Message)"
+            }
+          }
+          $failures | ForEach-Object { Write-Error $_ }
+          if ($failures.Count -gt 0) { throw "PowerShell parse failures: $($failures.Count)" }
+      - name: Run ${{ matrix.case }} fixture
+        shell: pwsh
+        run: ./ops/test-status-snapshot.ps1 -Case '${{ matrix.case }}'
+
+  schema-identity:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - name: Enforce producer and consumer schema identity
+        shell: pwsh
+        run: |
+          $producer = Get-Content -LiteralPath bin/pleiades-snapshot.sh -Raw
+          $consumer = Get-Content -LiteralPath bin/pleiades-supervisor.ps1 -Raw
+          if (-not $producer.Contains('"schema": "pleiades.status/v1"')) { throw 'producer schema identity missing' }
+          if (-not $consumer.Contains("'pleiades.status/v1'")) { throw 'consumer schema identity missing' }
+          if (-not $consumer.Contains('Assert-NoDuplicateJsonProperties')) { throw 'duplicate-key validation missing' }
+          if (-not $consumer.Contains('Assert-ExactJsonProperties')) { throw 'exact-object validation missing' }

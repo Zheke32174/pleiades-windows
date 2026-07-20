@@ -12,7 +12,9 @@ param(
   [string]$Machine = 'pleiades',
   [string]$Unit = 'pleiades-container.service',
   [switch]$ValidateConfigurationOnly,
-  [string]$ValidateSnapshotJson
+  [string]$ValidateSnapshotJson,
+  [ValidateSet('down', 'running', 'degraded')]
+  [string]$ExpectedSnapshotContainerState
 )
 
 $ErrorActionPreference = 'Stop'
@@ -21,6 +23,9 @@ $CanonicalMachine = 'pleiades'
 $CanonicalUnit = 'pleiades-container.service'
 $MaxSnapshotBytes = 2MB
 $MaxSnapshotCollectionItems = 4096
+$MaxAgentProperties = 64
+$MaxAgentDepth = 6
+$MaxAgentStringLength = 4096
 
 function Assert-Configuration {
   if ($Distro -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$') {
@@ -65,7 +70,93 @@ function Get-RequiredJsonProperty([pscustomobject]$Object, [string]$Name) {
   return $property
 }
 
-function ConvertFrom-ValidatedSnapshot([string]$Raw) {
+function Assert-ExactJsonProperties(
+  [pscustomobject]$Object,
+  [string]$Path,
+  [string[]]$Expected
+) {
+  $actual = @($Object.PSObject.Properties.Name)
+  if ($actual.Count -ne $Expected.Count) {
+    throw "$Path must contain exactly: $($Expected -join ', ')"
+  }
+  foreach ($name in $Expected) {
+    if ($actual -cnotcontains $name) {
+      throw "$Path must contain exactly: $($Expected -join ', ')"
+    }
+  }
+}
+
+function Assert-NoDuplicateJsonProperties(
+  [System.Text.Json.JsonElement]$Element,
+  [string]$Path,
+  [int]$Depth = 0
+) {
+  if ($Depth -gt 32) { throw 'snapshot JSON nesting exceeds 32 levels' }
+  if ($Element.ValueKind -eq [System.Text.Json.JsonValueKind]::Object) {
+    $names = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($property in $Element.EnumerateObject()) {
+      if (-not $names.Add($property.Name)) {
+        throw "snapshot contains duplicate property at ${Path}.$($property.Name)"
+      }
+      Assert-NoDuplicateJsonProperties -Element $property.Value -Path "${Path}.$($property.Name)" -Depth ($Depth + 1)
+    }
+  } elseif ($Element.ValueKind -eq [System.Text.Json.JsonValueKind]::Array) {
+    $index = 0
+    foreach ($item in $Element.EnumerateArray()) {
+      Assert-NoDuplicateJsonProperties -Element $item -Path "${Path}[$index]" -Depth ($Depth + 1)
+      $index++
+    }
+  }
+}
+
+function Assert-BoundedAgentValue(
+  $Value,
+  [string]$Path,
+  [int]$Depth = 0
+) {
+  if ($Depth -gt $MaxAgentDepth) {
+    throw "$Path exceeds the bounded agent-record nesting depth"
+  }
+  if ($null -eq $Value -or $Value -is [bool] -or
+      $Value -is [int] -or $Value -is [long]) {
+    return
+  }
+  if ($Value -is [string]) {
+    if ($Value.Length -gt $MaxAgentStringLength -or $Value -match '[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]') {
+      throw "$Path contains an oversized or unsupported string"
+    }
+    return
+  }
+  if ($Value -is [double] -or $Value -is [decimal] -or $Value -is [single]) {
+    throw "$Path must not contain floating-point identity"
+  }
+  if ($Value -is [System.Array]) {
+    if ($Value.Count -gt 128) { throw "$Path exceeds 128 array items" }
+    for ($index = 0; $index -lt $Value.Count; $index++) {
+      Assert-BoundedAgentValue -Value $Value[$index] -Path "${Path}[$index]" -Depth ($Depth + 1)
+    }
+    return
+  }
+  if ($Value -is [pscustomobject]) {
+    $properties = @($Value.PSObject.Properties)
+    if ($properties.Count -gt $MaxAgentProperties) {
+      throw "$Path exceeds $MaxAgentProperties properties"
+    }
+    foreach ($property in $properties) {
+      if ($property.Name -notmatch '^[A-Za-z][A-Za-z0-9_.-]{0,63}$') {
+        throw "$Path contains an invalid property name: $($property.Name)"
+      }
+      Assert-BoundedAgentValue -Value $property.Value -Path "${Path}.$($property.Name)" -Depth ($Depth + 1)
+    }
+    return
+  }
+  throw "$Path contains an unsupported JSON value type"
+}
+
+function ConvertFrom-ValidatedSnapshot(
+  [string]$Raw,
+  [string]$ExpectedContainerState
+) {
   if ([string]::IsNullOrWhiteSpace($Raw)) {
     throw 'snapshot JSON is empty'
   }
@@ -73,6 +164,22 @@ function ConvertFrom-ValidatedSnapshot([string]$Raw) {
   $trimmed = $Raw.Trim()
   if ($trimmed.Length -lt 2 -or $trimmed[0] -ne '{' -or $trimmed[$trimmed.Length - 1] -ne '}') {
     throw 'snapshot top level must be exactly one JSON object'
+  }
+
+  $document = $null
+  try {
+    $document = [System.Text.Json.JsonDocument]::Parse($trimmed)
+    Assert-NoDuplicateJsonProperties -Element $document.RootElement -Path '$'
+    foreach ($arrayName in 'agents', 'events') {
+      $arrayElement = $document.RootElement.GetProperty($arrayName)
+      if ($arrayElement.ValueKind -ne [System.Text.Json.JsonValueKind]::Array) {
+        throw "snapshot $arrayName must be a JSON array"
+      }
+    }
+  } catch {
+    throw "snapshot JSON object identity is invalid: $($_.Exception.Message)"
+  } finally {
+    if ($null -ne $document) { $document.Dispose() }
   }
 
   try {
@@ -84,14 +191,21 @@ function ConvertFrom-ValidatedSnapshot([string]$Raw) {
     throw 'snapshot top level must be exactly one JSON object'
   }
 
+  Assert-ExactJsonProperties -Object $parsed -Path 'snapshot' -Expected @(
+    'schema', 'container', 'timestamp', 'ledger', 'agents', 'events'
+  )
+
   $schema = (Get-RequiredJsonProperty $parsed 'schema').Value
-  if ($schema -isnot [string] -or $schema.Length -gt 64 -or $schema -cne 'pleiades.status/v1') {
-    throw 'snapshot schema must be the exact bounded scalar pleiades.status/v1'
+  if ($schema -isnot [string] -or $schema -cne 'pleiades.status/v1') {
+    throw 'snapshot schema must be the exact scalar pleiades.status/v1'
   }
 
   $container = (Get-RequiredJsonProperty $parsed 'container').Value
-  if ($container -isnot [string] -or $container.Length -gt 16 -or $container -notin 'running', 'degraded') {
-    throw 'snapshot container must be one bounded running/degraded scalar'
+  if ($container -isnot [string] -or $container -notin 'down', 'running', 'degraded') {
+    throw 'snapshot container must be exactly down, running, or degraded'
+  }
+  if ($ExpectedContainerState -and $container -cne $ExpectedContainerState) {
+    throw "snapshot container state $container disagrees with independently observed state $ExpectedContainerState"
   }
 
   $timestamp = (Get-RequiredJsonProperty $parsed 'timestamp').Value
@@ -103,28 +217,76 @@ function ConvertFrom-ValidatedSnapshot([string]$Raw) {
   if ($null -eq $ledger -or $ledger -is [Array] -or $ledger -isnot [pscustomobject]) {
     throw 'snapshot ledger must be exactly one object'
   }
+  Assert-ExactJsonProperties -Object $ledger -Path 'snapshot.ledger' -Expected @('state', 'records')
   $ledgerState = (Get-RequiredJsonProperty $ledger 'state').Value
-  if ($ledgerState -isnot [string] -or $ledgerState.Length -lt 1 -or $ledgerState.Length -gt 32 -or
+  if ($ledgerState -isnot [string] -or
       $ledgerState -notin 'VALID', 'EMPTY', 'MISSING', 'TAMPERED', 'ERROR', 'UNKNOWN') {
-    throw 'snapshot ledger.state must be one bounded recognized scalar'
+    throw 'snapshot ledger.state must be one recognized scalar'
   }
   $ledgerRecords = (Get-RequiredJsonProperty $ledger 'records').Value
   if (($ledgerRecords -isnot [int] -and $ledgerRecords -isnot [long]) -or $ledgerRecords -lt 0) {
     throw 'snapshot ledger.records must be a nonnegative integer scalar'
   }
 
-  foreach ($field in 'agents', 'events') {
-    $collection = (Get-RequiredJsonProperty $parsed $field).Value
-    if ($collection -isnot [System.Array]) {
-      throw "snapshot $field must be an array"
+  $agents = @((Get-RequiredJsonProperty $parsed 'agents').Value)
+  $events = @((Get-RequiredJsonProperty $parsed 'events').Value)
+  if ($agents.Count -gt $MaxSnapshotCollectionItems) {
+    throw "snapshot agents exceeds $MaxSnapshotCollectionItems items"
+  }
+  if ($events.Count -gt $MaxSnapshotCollectionItems) {
+    throw "snapshot events exceeds $MaxSnapshotCollectionItems items"
+  }
+
+  foreach ($agent in $agents) {
+    if ($null -eq $agent -or $agent -is [Array] -or $agent -isnot [pscustomobject]) {
+      throw 'snapshot agents entries must be objects'
     }
-    if ($collection.Count -gt $MaxSnapshotCollectionItems) {
-      throw "snapshot $field exceeds $MaxSnapshotCollectionItems items"
+    $agentName = (Get-RequiredJsonProperty $agent 'agent').Value
+    $agentStatus = (Get-RequiredJsonProperty $agent 'status').Value
+    if ($agentName -isnot [string] -or $agentName -notmatch '^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$') {
+      throw 'snapshot agent.agent must be one bounded identifier'
     }
-    foreach ($item in $collection) {
-      if ($null -eq $item -or $item -is [Array] -or $item -isnot [pscustomobject]) {
-        throw "snapshot $field entries must be objects"
-      }
+    if ($agentStatus -isnot [string] -or $agentStatus -notmatch '^[A-Za-z0-9][A-Za-z0-9._/-]{0,63}$') {
+      throw 'snapshot agent.status must be one bounded identifier'
+    }
+    Assert-BoundedAgentValue -Value $agent -Path "snapshot.agents[$agentName]"
+  }
+
+  $lastSequence = 0L
+  foreach ($event in $events) {
+    if ($null -eq $event -or $event -is [Array] -or $event -isnot [pscustomobject]) {
+      throw 'snapshot events entries must be objects'
+    }
+    Assert-ExactJsonProperties -Object $event -Path 'snapshot.events[]' -Expected @(
+      'seq', 'timestamp', 'digest', 'event'
+    )
+    $sequence = (Get-RequiredJsonProperty $event 'seq').Value
+    $eventTimestamp = (Get-RequiredJsonProperty $event 'timestamp').Value
+    $digest = (Get-RequiredJsonProperty $event 'digest').Value
+    $eventText = (Get-RequiredJsonProperty $event 'event').Value
+    if (($sequence -isnot [int] -and $sequence -isnot [long]) -or $sequence -lt 1) {
+      throw 'snapshot event.seq must be a positive integer'
+    }
+    if ([long]$sequence -le $lastSequence) {
+      throw 'snapshot events must use strictly increasing unique sequence values'
+    }
+    $lastSequence = [long]$sequence
+    if (($eventTimestamp -isnot [int] -and $eventTimestamp -isnot [long]) -or $eventTimestamp -lt 1) {
+      throw 'snapshot event.timestamp must be a positive integer'
+    }
+    if ($digest -isnot [string] -or $digest -notmatch '^[0-9a-f]{64}$') {
+      throw 'snapshot event.digest must be one lowercase SHA-256 scalar'
+    }
+    if ($eventText -isnot [string] -or $eventText.Length -gt 2048 -or
+        $eventText -match '[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]') {
+      throw 'snapshot event.event must be one bounded text scalar'
+    }
+  }
+
+  if ($container -eq 'down') {
+    if ($ledgerState -cne 'UNKNOWN' -or $ledgerRecords -ne 0 -or
+        $agents.Count -ne 0 -or $events.Count -ne 0) {
+      throw 'a down snapshot must contain UNKNOWN empty ledger state and no agent or event records'
     }
   }
 
@@ -230,7 +392,10 @@ function Write-AtomicUtf8([string]$Path, [string]$Text) {
   }
 }
 
-function Publish-Snapshot([string]$BridgeRoot) {
+function Publish-Snapshot(
+  [string]$BridgeRoot,
+  [string]$ExpectedContainerState
+) {
   $snapshotScript = "$BridgeRoot/bin/pleiades-snapshot.sh"
   $result = Invoke-WslTyped -Arguments @('bash', '--', $snapshotScript)
   $raw = $result.Output -join "`n"
@@ -238,11 +403,11 @@ function Publish-Snapshot([string]$BridgeRoot) {
   if ($byteCount -lt 2 -or $byteCount -gt $MaxSnapshotBytes) {
     throw "snapshot size is outside the accepted bound: $byteCount bytes"
   }
-  $parsed = ConvertFrom-ValidatedSnapshot -Raw $raw
+  $parsed = ConvertFrom-ValidatedSnapshot -Raw $raw -ExpectedContainerState $ExpectedContainerState
 
   $destination = Join-Path $portalDir 'status.json'
   Write-AtomicUtf8 -Path $destination -Text ($raw + "`n")
-  Write-Log "snapshot published ($byteCount bytes, ledger=$($parsed.ledger.state))"
+  Write-Log "snapshot published ($byteCount bytes, container=$($parsed.container), ledger=$($parsed.ledger.state))"
 }
 
 function Mirror-EncryptedSnapshots([string]$BridgeRoot) {
@@ -278,9 +443,13 @@ find "$src" -maxdepth 1 -type f \( -name 'maia-*.enc' -o -name 'maia-*.sig' \) -
 }
 
 Assert-Configuration
+if ($PSBoundParameters.ContainsKey('ExpectedSnapshotContainerState') -and
+    -not $PSBoundParameters.ContainsKey('ValidateSnapshotJson')) {
+  throw 'ExpectedSnapshotContainerState is valid only with ValidateSnapshotJson'
+}
 if ($PSBoundParameters.ContainsKey('ValidateSnapshotJson')) {
-  ConvertFrom-ValidatedSnapshot -Raw $ValidateSnapshotJson | Out-Null
-  Write-Output 'snapshot JSON is valid and bounded'
+  ConvertFrom-ValidatedSnapshot -Raw $ValidateSnapshotJson -ExpectedContainerState $ExpectedSnapshotContainerState | Out-Null
+  Write-Output 'snapshot JSON is valid, exact, and bounded'
   exit 0
 }
 if ($ValidateConfigurationOnly) {
@@ -325,7 +494,7 @@ try {
   }
 
   Write-Log "container state=$state"
-  Publish-Snapshot -BridgeRoot $bridgeRoot
+  Publish-Snapshot -BridgeRoot $bridgeRoot -ExpectedContainerState $state
   Mirror-EncryptedSnapshots -BridgeRoot $bridgeRoot
   exit 0
 } catch {
