@@ -79,7 +79,8 @@ Check 'collector no longer writes naked cursor text' {
   return -not $collectorSource.Contains('Set-Content -Path $cursorFile')
 }
 
-$supervisorSource = Get-Content (Join-Path $repoRoot 'bin/pleiades-supervisor.ps1') -Raw
+$supervisorPath = Join-Path $repoRoot 'bin/pleiades-supervisor.ps1'
+$supervisorSource = Get-Content $supervisorPath -Raw
 Check 'supervisor uses typed WSL argv rather than bash -lc command strings' {
   return $supervisorSource.Contains('function Invoke-WslTyped') -and
     -not $supervisorSource.Contains('bash -lc')
@@ -107,13 +108,50 @@ Check 'supervisor starts only after a confirmed inactive canonical unit' {
 }
 Check 'supervisor bounds snapshot output and uses atomic publication' {
   return $supervisorSource.Contains('$MaxSnapshotBytes = 2MB') -and
+    $supervisorSource.Contains('$MaxSnapshotCollectionItems = 4096') -and
     $supervisorSource.Contains('snapshot size is outside the accepted bound') -and
     $supervisorSource.Contains('function Write-AtomicUtf8')
+}
+Check 'supervisor validates exact snapshot object and field shapes before publication' {
+  return $supervisorSource.Contains('snapshot top level must be exactly one JSON object') -and
+    $supervisorSource.Contains('snapshot schema must be the exact bounded scalar') -and
+    $supervisorSource.Contains('snapshot ledger must be exactly one object') -and
+    $supervisorSource.Contains('snapshot agents must be an array') -and
+    $supervisorSource.Contains('snapshot events must be an array')
 }
 Check 'supervisor passes mirror paths as argv to fixed script logic' {
   return $supervisorSource.Contains('function Invoke-WslScript') -and
     $supervisorSource.Contains('Invoke-WslScript -Script $copyScript -Arguments @($source, $destination)') -and
     $supervisorSource.Contains('mktemp -- "$dst/.${base}.tmp.XXXXXX"')
+}
+
+$powerShellExecutable = (Get-Process -Id $PID).Path
+function Test-SnapshotFixture([string]$Json, [bool]$ShouldPass) {
+  $null = & $powerShellExecutable -NoProfile -NonInteractive -File $supervisorPath -ValidateSnapshotJson $Json 2>&1
+  $passed = $LASTEXITCODE -eq 0
+  return $passed -eq $ShouldPass
+}
+
+$validSnapshot = '{"schema":"pleiades.status/v1","container":"running","timestamp":1,"ledger":{"state":"VALID","records":0},"agents":[],"events":[]}'
+Check 'snapshot validator accepts one exact valid object' {
+  return Test-SnapshotFixture $validSnapshot $true
+}
+Check 'snapshot validator rejects a top-level one-item array' {
+  return Test-SnapshotFixture "[$validSnapshot]" $false
+}
+Check 'snapshot validator rejects collection-valued schema' {
+  return Test-SnapshotFixture '{"schema":["pleiades.status/v1"],"container":"running","timestamp":1,"ledger":{"state":"VALID","records":0},"agents":[],"events":[]}' $false
+}
+Check 'snapshot validator rejects collection-valued container' {
+  return Test-SnapshotFixture '{"schema":"pleiades.status/v1","container":["running"],"timestamp":1,"ledger":{"state":"VALID","records":0},"agents":[],"events":[]}' $false
+}
+Check 'snapshot validator rejects array-shaped ledger' {
+  return Test-SnapshotFixture '{"schema":"pleiades.status/v1","container":"running","timestamp":1,"ledger":[{"state":"VALID","records":0}],"agents":[],"events":[]}' $false
+}
+Check 'snapshot validator rejects scalar agents and events' {
+  $badAgents = Test-SnapshotFixture '{"schema":"pleiades.status/v1","container":"running","timestamp":1,"ledger":{"state":"VALID","records":0},"agents":"none","events":[]}' $false
+  $badEvents = Test-SnapshotFixture '{"schema":"pleiades.status/v1","container":"running","timestamp":1,"ledger":{"state":"VALID","records":0},"agents":[],"events":"none"}' $false
+  return $badAgents -and $badEvents
 }
 
 $installerPath = Join-Path $repoRoot 'ops/install-windows.ps1'
