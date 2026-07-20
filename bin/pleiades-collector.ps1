@@ -73,7 +73,9 @@ function Add-Utf8Line([string]$Path, [string]$Line) {
 function Write-AtomicUtf8([string]$Path, [string]$Text) {
   $directory = Split-Path -Parent $Path
   $name = Split-Path -Leaf $Path
-  $temporary = Join-Path $directory ".$name.tmp.$PID.$([Guid]::NewGuid().ToString('N'))"
+  $nonce = "$PID.$([Guid]::NewGuid().ToString('N'))"
+  $temporary = Join-Path $directory ".$name.tmp.$nonce"
+  $backup = Join-Path $directory ".$name.bak.$nonce"
   $encoding = [Text.UTF8Encoding]::new($false)
   $bytes = $encoding.GetBytes($Text)
   $stream = [IO.FileStream]::new(
@@ -90,12 +92,14 @@ function Write-AtomicUtf8([string]$Path, [string]$Text) {
   }
   try {
     if (Test-Path -LiteralPath $Path) {
-      [IO.File]::Replace($temporary, $Path, $null, $true)
+      [IO.File]::Replace($temporary, $Path, $backup, $true)
+      Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
     } else {
       [IO.File]::Move($temporary, $Path)
     }
   } catch {
     Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
     throw
   }
 }
@@ -138,7 +142,7 @@ function Read-CursorState {
     throw 'collector cursor has unknown or missing fields'
   }
   if ($value.schema -ne $cursorSchema -or $value.log -ne 'Security') {
-    throw "collector cursor schema/log mismatch"
+    throw 'collector cursor schema/log mismatch'
   }
   $epoch = [Guid]::Empty
   if (-not [Guid]::TryParse("$($value.collection_epoch)", [ref]$epoch)) {
@@ -208,10 +212,10 @@ try {
   if ($epochInvalid) {
     if (-not $AcceptLogReset) {
       throw (
-        "Security log identity/high-water no longer matches the saved cursor " +
+        'Security log identity/high-water no longer matches the saved cursor ' +
         "(saved_host=$($cursorState.host) current_host=$currentHost " +
         "cursor=$cursor latest=$latestRecordId). Re-run with -AcceptLogReset " +
-        "only after reviewing the log reset or host replacement."
+        'only after reviewing the log reset or host replacement.'
       )
     }
     $cursorState = New-CursorState -RecordId $latestRecordId

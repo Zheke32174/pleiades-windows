@@ -12,6 +12,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$CanonicalMachine = 'pleiades'
+$CanonicalUnit = 'pleiades-container.service'
 $TaskNames = [ordered]@{
   Collector = 'Pleiades Security Collector'
   Netwatch = 'Pleiades Network Watch'
@@ -43,6 +45,18 @@ function Test-Administrator {
 function Assert-SafeText([string]$Name, [string]$Value) {
   if ([string]::IsNullOrWhiteSpace($Value)) { throw "$Name must not be empty" }
   if ($Value -match '[\x00-\x1F\x7F"]') { throw "$Name contains an unsupported control character or quote" }
+}
+
+function Assert-LifecycleConfiguration {
+  if ($Distro -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$') {
+    throw 'Distro must use a bounded non-shell identifier'
+  }
+  if ($Machine -cne $CanonicalMachine) {
+    throw "Machine must be exactly $CanonicalMachine"
+  }
+  if ($Unit -cne $CanonicalUnit) {
+    throw "Unit must be exactly $CanonicalUnit"
+  }
 }
 
 function Resolve-InstallRoot([string]$Path) {
@@ -151,10 +165,8 @@ function Register-ReviewedTask(
 }
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
+Assert-LifecycleConfiguration
 $InstallRoot = Resolve-InstallRoot $InstallRoot
-Assert-SafeText 'Distro' $Distro
-Assert-SafeText 'Machine' $Machine
-Assert-SafeText 'Unit' $Unit
 Assert-SafeText 'SupervisorUser' $SupervisorUser
 
 $versionPath = Join-Path $repoRoot 'VERSION'
@@ -189,7 +201,7 @@ if ($RegisterTasks) {
   $supervisorPath = Join-Path $InstallRoot 'bin\pleiades-supervisor.ps1'
   $collectorArgs = "-NoLogo -NoProfile -NonInteractive -File $(Quote-TaskValue $collectorPath) -Root $(Quote-TaskValue $InstallRoot)"
   $netwatchArgs = "-NoLogo -NoProfile -NonInteractive -File $(Quote-TaskValue $netwatchPath) -Root $(Quote-TaskValue $InstallRoot)"
-  $supervisorArgs = "-NoLogo -NoProfile -NonInteractive -File $(Quote-TaskValue $supervisorPath) -Root $(Quote-TaskValue $InstallRoot) -Distro $(Quote-TaskValue $Distro) -Machine $(Quote-TaskValue $Machine) -Unit $(Quote-TaskValue $Unit)"
+  $supervisorArgs = "-NoLogo -NoProfile -NonInteractive -File $(Quote-TaskValue $supervisorPath) -Root $(Quote-TaskValue $InstallRoot) -Distro $(Quote-TaskValue $Distro)"
 
   Register-ReviewedTask -Name $TaskNames.Collector -ScriptPath $collectorPath -Arguments $collectorArgs -Triggers @($repeat) -Principal $systemPrincipal -PrincipalLabel 'SYSTEM' -BackupRoot $backupRoot
   Register-ReviewedTask -Name $TaskNames.Netwatch -ScriptPath $netwatchPath -Arguments $netwatchArgs -Triggers @($repeat) -Principal $systemPrincipal -PrincipalLabel 'SYSTEM' -BackupRoot $backupRoot
@@ -224,8 +236,8 @@ if (-not $DryRun) {
     installed_at = [DateTimeOffset]::UtcNow.ToString('o')
     install_root = $InstallRoot
     distro = $Distro
-    machine = $Machine
-    unit = $Unit
+    machine = $CanonicalMachine
+    unit = $CanonicalUnit
     scripts_authenticode = 'not-claimed'
     managed_files = $installed
     tasks_registered = [bool]$RegisterTasks

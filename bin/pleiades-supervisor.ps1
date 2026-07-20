@@ -1,8 +1,9 @@
 # pleiades-supervisor.ps1 — Windows-side lifecycle and status coordinator.
 #
 # The Linux host's systemd unit is the sole container supervisor. This script
-# starts WSL when necessary, asks systemd for the canonical unit state, publishes
-# an atomically validated status snapshot, and mirrors encrypted snapshots.
+# may query and start exactly one canonical unit and machine through typed WSL
+# argv. It publishes one validated status snapshot and mirrors encrypted
+# snapshots into the exact installed Windows root.
 
 [CmdletBinding()]
 param(
@@ -10,11 +11,282 @@ param(
   [string]$Distro = 'Ubuntu',
   [string]$Machine = 'pleiades',
   [string]$Unit = 'pleiades-container.service',
-  [string]$LinuxBridgeRoot = '/mnt/c/pleiades'
+  [switch]$ValidateConfigurationOnly,
+  [string]$ValidateSnapshotJson
 )
 
 $ErrorActionPreference = 'Stop'
 $env:WSL_UTF8 = '1'
+$CanonicalMachine = 'pleiades'
+$CanonicalUnit = 'pleiades-container.service'
+$MaxSnapshotBytes = 2MB
+$MaxSnapshotCollectionItems = 4096
+
+function Assert-Configuration {
+  if ($Distro -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$') {
+    throw 'Distro must use a bounded non-shell identifier'
+  }
+  if ($Machine -cne $CanonicalMachine) {
+    throw "Machine must be exactly $CanonicalMachine"
+  }
+  if ($Unit -cne $CanonicalUnit) {
+    throw "Unit must be exactly $CanonicalUnit"
+  }
+  if ([string]::IsNullOrWhiteSpace($Root) -or $Root -match '[\x00-\x1F\x7F"]') {
+    throw 'Root is empty or contains an unsupported control character or quote'
+  }
+  if ($IsWindows) {
+    $resolved = [IO.Path]::GetFullPath($Root).TrimEnd('\')
+    $driveRoot = [IO.Path]::GetPathRoot($resolved).TrimEnd('\')
+    if ($resolved.Equals($driveRoot, [StringComparison]::OrdinalIgnoreCase)) {
+      throw "refusing drive root as Root: $resolved"
+    }
+    $script:Root = $resolved
+  }
+}
+
+function Assert-PosixPath([string]$Name, [string]$Value) {
+  if ($Value -notmatch '^/[A-Za-z0-9._/-]+$') {
+    throw "$Name is not a bounded absolute POSIX path"
+  }
+  $segments = @($Value.Split('/', [StringSplitOptions]::RemoveEmptyEntries))
+  if ($segments -contains '.' -or $segments -contains '..') {
+    throw "$Name contains a traversal segment"
+  }
+  if ($Value -eq '/') { throw "$Name must not be the filesystem root" }
+  return $Value.TrimEnd('/')
+}
+
+function Get-RequiredJsonProperty([pscustomobject]$Object, [string]$Name) {
+  $property = $Object.PSObject.Properties[$Name]
+  if ($null -eq $property) {
+    throw "snapshot is missing required field: $Name"
+  }
+  return $property
+}
+
+function ConvertFrom-ValidatedSnapshot([string]$Raw) {
+  if ([string]::IsNullOrWhiteSpace($Raw)) {
+    throw 'snapshot JSON is empty'
+  }
+
+  $trimmed = $Raw.Trim()
+  if ($trimmed.Length -lt 2 -or $trimmed[0] -ne '{' -or $trimmed[$trimmed.Length - 1] -ne '}') {
+    throw 'snapshot top level must be exactly one JSON object'
+  }
+
+  try {
+    $parsed = $trimmed | ConvertFrom-Json -ErrorAction Stop
+  } catch {
+    throw "snapshot is not valid JSON: $($_.Exception.Message)"
+  }
+  if ($null -eq $parsed -or $parsed -is [Array] -or $parsed -isnot [pscustomobject]) {
+    throw 'snapshot top level must be exactly one JSON object'
+  }
+
+  $schema = (Get-RequiredJsonProperty $parsed 'schema').Value
+  if ($schema -isnot [string] -or $schema.Length -gt 64 -or $schema -cne 'pleiades.status/v1') {
+    throw 'snapshot schema must be the exact bounded scalar pleiades.status/v1'
+  }
+
+  $container = (Get-RequiredJsonProperty $parsed 'container').Value
+  if ($container -isnot [string] -or $container.Length -gt 16 -or $container -notin 'running', 'degraded') {
+    throw 'snapshot container must be one bounded running/degraded scalar'
+  }
+
+  $timestamp = (Get-RequiredJsonProperty $parsed 'timestamp').Value
+  if (($timestamp -isnot [int] -and $timestamp -isnot [long]) -or $timestamp -lt 1) {
+    throw 'snapshot timestamp must be a positive integer scalar'
+  }
+
+  $ledger = (Get-RequiredJsonProperty $parsed 'ledger').Value
+  if ($null -eq $ledger -or $ledger -is [Array] -or $ledger -isnot [pscustomobject]) {
+    throw 'snapshot ledger must be exactly one object'
+  }
+  $ledgerState = (Get-RequiredJsonProperty $ledger 'state').Value
+  if ($ledgerState -isnot [string] -or $ledgerState.Length -lt 1 -or $ledgerState.Length -gt 32 -or
+      $ledgerState -notin 'VALID', 'EMPTY', 'MISSING', 'TAMPERED', 'ERROR', 'UNKNOWN') {
+    throw 'snapshot ledger.state must be one bounded recognized scalar'
+  }
+  $ledgerRecords = (Get-RequiredJsonProperty $ledger 'records').Value
+  if (($ledgerRecords -isnot [int] -and $ledgerRecords -isnot [long]) -or $ledgerRecords -lt 0) {
+    throw 'snapshot ledger.records must be a nonnegative integer scalar'
+  }
+
+  foreach ($field in 'agents', 'events') {
+    $collection = (Get-RequiredJsonProperty $parsed $field).Value
+    if ($collection -isnot [System.Array]) {
+      throw "snapshot $field must be an array"
+    }
+    if ($collection.Count -gt $MaxSnapshotCollectionItems) {
+      throw "snapshot $field exceeds $MaxSnapshotCollectionItems items"
+    }
+    foreach ($item in $collection) {
+      if ($null -eq $item -or $item -is [Array] -or $item -isnot [pscustomobject]) {
+        throw "snapshot $field entries must be objects"
+      }
+    }
+  }
+
+  return $parsed
+}
+
+function Invoke-WslTyped(
+  [string[]]$Arguments,
+  [int[]]$AllowedExitCodes = @(0)
+) {
+  $command = @('-d', $Distro, '-u', 'root', '--') + $Arguments
+  $output = & wsl.exe @command 2>&1
+  $exitCode = $LASTEXITCODE
+  if ($AllowedExitCodes -notcontains $exitCode) {
+    $rendered = $Arguments | ForEach-Object { "[$_]" }
+    throw "typed WSL command failed (rc=$exitCode): $($rendered -join ' ')`n$($output -join "`n")"
+  }
+  return [pscustomobject]@{
+    ExitCode = $exitCode
+    Output = @($output | ForEach-Object { "$_" })
+  }
+}
+
+function Invoke-WslScript(
+  [string]$Script,
+  [string[]]$Arguments
+) {
+  $command = @('-d', $Distro, '-u', 'root', '--', 'bash', '-s', '--') + $Arguments
+  $output = $Script | & wsl.exe @command 2>&1
+  $exitCode = $LASTEXITCODE
+  if ($exitCode -ne 0) {
+    throw "fixed WSL script failed (rc=$exitCode)`n$($output -join "`n")"
+  }
+  return @($output | ForEach-Object { "$_" })
+}
+
+function Get-WslBridgeRoot {
+  $result = Invoke-WslTyped -Arguments @('wslpath', '-a', '-u', $Root)
+  $lines = @($result.Output | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+  if ($lines.Count -ne 1) { throw 'wslpath returned an ambiguous bridge root' }
+  return Assert-PosixPath 'derived WSL bridge root' $lines[0]
+}
+
+function Get-ContainerRoot {
+  $result = Invoke-WslTyped -Arguments @('cat', '--', '/etc/pleiades/container.env')
+  $lines = @(
+    $result.Output |
+      ForEach-Object { $_.Trim() } |
+      Where-Object { $_ -and -not $_.StartsWith('#') }
+  )
+  if ($lines.Count -ne 1 -or $lines[0] -notmatch '^PLEIADES_ROOT=(/.+)$') {
+    throw '/etc/pleiades/container.env must contain exactly one plain PLEIADES_ROOT assignment'
+  }
+  $root = Assert-PosixPath 'PLEIADES_ROOT' $Matches[1]
+  Invoke-WslTyped -Arguments @('test', '-f', "$root/.pleiades-container-root") | Out-Null
+  return $root
+}
+
+function Get-ContainerState {
+  $unitArguments = @('systemctl', 'is-active', '--quiet', $CanonicalUnit)
+  $unitState = Invoke-WslTyped -Arguments $unitArguments -AllowedExitCodes @(0, 3, 4)
+  if ($unitState.ExitCode -eq 3) { return 'inactive' }
+  if ($unitState.ExitCode -eq 4) {
+    throw "canonical unit is unknown to systemd: $CanonicalUnit"
+  }
+
+  $machineState = Invoke-WslTyped -Arguments @(
+    'machinectl', 'show', $CanonicalMachine, '-p', 'State', '--value'
+  )
+  $lines = @($machineState.Output | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+  if ($lines.Count -ne 1 -or $lines[0] -notin 'running', 'degraded') {
+    throw "canonical unit is active but machine state is invalid: $($lines -join ',')"
+  }
+  return $lines[0]
+}
+
+function Write-AtomicUtf8([string]$Path, [string]$Text) {
+  $directory = Split-Path -Parent $Path
+  $name = Split-Path -Leaf $Path
+  $temporary = Join-Path $directory ".$name.tmp.$PID.$([Guid]::NewGuid().ToString('N'))"
+  $bytes = [Text.UTF8Encoding]::new($false).GetBytes($Text)
+  $stream = [IO.FileStream]::new(
+    $temporary,
+    [IO.FileMode]::CreateNew,
+    [IO.FileAccess]::Write,
+    [IO.FileShare]::None
+  )
+  try {
+    $stream.Write($bytes, 0, $bytes.Length)
+    $stream.Flush($true)
+  } finally {
+    $stream.Dispose()
+  }
+  try {
+    if (Test-Path -LiteralPath $Path) {
+      [IO.File]::Replace($temporary, $Path, $null, $true)
+    } else {
+      [IO.File]::Move($temporary, $Path)
+    }
+  } catch {
+    Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
+    throw
+  }
+}
+
+function Publish-Snapshot([string]$BridgeRoot) {
+  $snapshotScript = "$BridgeRoot/bin/pleiades-snapshot.sh"
+  $result = Invoke-WslTyped -Arguments @('bash', '--', $snapshotScript)
+  $raw = $result.Output -join "`n"
+  $byteCount = [Text.UTF8Encoding]::new($false).GetByteCount($raw)
+  if ($byteCount -lt 2 -or $byteCount -gt $MaxSnapshotBytes) {
+    throw "snapshot size is outside the accepted bound: $byteCount bytes"
+  }
+  $parsed = ConvertFrom-ValidatedSnapshot -Raw $raw
+
+  $destination = Join-Path $portalDir 'status.json'
+  Write-AtomicUtf8 -Path $destination -Text ($raw + "`n")
+  Write-Log "snapshot published ($byteCount bytes, ledger=$($parsed.ledger.state))"
+}
+
+function Mirror-EncryptedSnapshots([string]$BridgeRoot) {
+  # Local resilience mirror only. The escrow key remains excluded. Independent
+  # recovery replication belongs to another device/provider and credential.
+  $containerRoot = Get-ContainerRoot
+  $source = "$containerRoot/var/lib/maia/snapshots"
+  $destination = "$BridgeRoot/backup"
+  $copyScript = @'
+set -euo pipefail
+src=$1
+dst=$2
+mkdir -p -- "$dst"
+[ -d "$src" ] || exit 0
+find "$src" -maxdepth 1 -type f \( -name 'maia-*.enc' -o -name 'maia-*.sig' \) -print0 |
+  while IFS= read -r -d '' file; do
+    [ -L "$file" ] && exit 20
+    base=$(basename -- "$file")
+    tmp=$(mktemp -- "$dst/.${base}.tmp.XXXXXX")
+    trap 'rm -f -- "$tmp"' EXIT
+    cp -- "$file" "$tmp"
+    mv -f -- "$tmp" "$dst/$base"
+    trap - EXIT
+  done
+'@
+  Invoke-WslScript -Script $copyScript -Arguments @($source, $destination) | Out-Null
+
+  $count = @(Get-ChildItem -LiteralPath $backupDir -Filter 'maia-*.enc' -File -ErrorAction SilentlyContinue).Count
+  if (Test-Path -LiteralPath (Join-Path $backupDir 'escrow.key')) {
+    throw 'escrow.key must never be present in the Windows snapshot mirror'
+  }
+  Write-Log "encrypted snapshot mirror contains $count archive(s)"
+}
+
+Assert-Configuration
+if ($PSBoundParameters.ContainsKey('ValidateSnapshotJson')) {
+  ConvertFrom-ValidatedSnapshot -Raw $ValidateSnapshotJson | Out-Null
+  Write-Output 'snapshot JSON is valid and bounded'
+  exit 0
+}
+if ($ValidateConfigurationOnly) {
+  Write-Output "configuration valid: distro=$Distro machine=$CanonicalMachine unit=$CanonicalUnit root=$Root"
+  exit 0
+}
 
 $stateDir = Join-Path $Root 'state'
 $portalDir = Join-Path $Root 'portal'
@@ -22,103 +294,39 @@ $backupDir = Join-Path $Root 'backup'
 $null = New-Item -ItemType Directory -Force -Path $stateDir, $portalDir, $backupDir
 $logPath = Join-Path $stateDir 'supervisor.log'
 
+function Write-Log([string]$Message) {
+  if ((Test-Path -LiteralPath $logPath) -and (Get-Item -LiteralPath $logPath).Length -gt 2MB) {
+    Move-Item -LiteralPath $logPath -Destination "$logPath.1" -Force
+  }
+  $line = "$(Get-Date -Format 'yyyy-MM-ddTHH:mm:ssK') $Message"
+  Add-Content -LiteralPath $logPath -Value $line -Encoding utf8
+  Write-Output $line
+}
+
 $mutex = [Threading.Mutex]::new($false, 'Global\PleiadesSupervisor')
 if (-not $mutex.WaitOne(0)) {
+  $mutex.Dispose()
   Write-Output 'another Pleiades supervisor run is active; exiting'
   exit 0
 }
 
-function Write-Log([string]$Message) {
-  if ((Test-Path $logPath) -and (Get-Item $logPath).Length -gt 2MB) {
-    Move-Item -Force $logPath "$logPath.1"
-  }
-  $line = "$(Get-Date -Format 'yyyy-MM-ddTHH:mm:ssK') $Message"
-  Add-Content -Path $logPath -Value $line -Encoding utf8
-  Write-Output $line
-}
-
-function Invoke-WslBash([string]$Command) {
-  $output = & wsl.exe -d $Distro -u root -- bash -lc $Command 2>&1
-  if ($LASTEXITCODE -ne 0) {
-    throw "WSL command failed (rc=$LASTEXITCODE): $Command`n$($output -join "`n")"
-  }
-  return @($output)
-}
-
-function Get-ContainerState {
-  try {
-    $cmd = "systemctl is-active '$Unit' >/dev/null 2>&1 || exit 3; machinectl show '$Machine' -p State --value"
-    $state = (Invoke-WslBash $cmd | Select-Object -Last 1).Trim()
-    if ($state -in 'running', 'degraded') { return $state }
-    return 'down'
-  } catch {
-    return 'down'
-  }
-}
-
-function Publish-Snapshot {
-  $snapshotScript = "$LinuxBridgeRoot/bin/pleiades-snapshot.sh"
-  $raw = (Invoke-WslBash "bash '$snapshotScript'") -join "`n"
-  $parsed = $raw | ConvertFrom-Json -ErrorAction Stop
-  if ($parsed.schema -ne 'pleiades.status/v1') {
-    throw "unexpected snapshot schema: $($parsed.schema)"
-  }
-
-  $destination = Join-Path $portalDir 'status.json'
-  $temporary = "$destination.tmp.$PID"
-  [IO.File]::WriteAllText($temporary, $raw, [Text.UTF8Encoding]::new($false))
-  Move-Item -Force $temporary $destination
-  Write-Log "snapshot published ($($raw.Length) bytes, ledger=$($parsed.ledger.state))"
-}
-
-function Mirror-EncryptedSnapshots {
-  # This is a local resilience mirror, not an offsite backup. The escrow key is
-  # deliberately excluded. Independent/offsite replication belongs to the
-  # recovery plane and should use a separate credential and destination.
-  $rootCommand = @'
-set -a
-[ -r /etc/pleiades/container.env ] && . /etc/pleiades/container.env
-printf '%s' "${PLEIADES_ROOT:-/var/lib/machines/pleiades}"
-'@
-  $rootLine = (Invoke-WslBash $rootCommand) -join ''
-  $source = "$rootLine/var/lib/maia/snapshots"
-  $copy = @"
-set -euo pipefail
-src='$source'
-dst='$LinuxBridgeRoot/backup'
-mkdir -p "`$dst"
-[ -d "`$src" ] || exit 0
-find "`$src" -maxdepth 1 -type f \( -name 'maia-*.enc' -o -name 'maia-*.sig' \) -print0 |
-  while IFS= read -r -d '' f; do
-    tmp="`$dst/`$(basename "`$f").tmp"
-    cp -- "`$f" "`$tmp"
-    mv -f -- "`$tmp" "`$dst/`$(basename "`$f")"
-  done
-"@
-  Invoke-WslBash $copy | Out-Null
-  $count = @(Get-ChildItem -Path $backupDir -Filter 'maia-*.enc' -ErrorAction SilentlyContinue).Count
-  if (Test-Path (Join-Path $backupDir 'escrow.key')) {
-    throw 'escrow.key must never be present in the Windows snapshot mirror'
-  }
-  Write-Log "encrypted snapshot mirror contains $count archive(s)"
-}
-
 try {
+  $bridgeRoot = Get-WslBridgeRoot
   $state = Get-ContainerState
-  if ($state -eq 'down') {
-    Write-Log "container down; starting $Unit"
-    Invoke-WslBash "systemctl start '$Unit'" | Out-Null
+  if ($state -eq 'inactive') {
+    Write-Log "canonical container inactive; starting $CanonicalUnit"
+    Invoke-WslTyped -Arguments @('systemctl', 'start', $CanonicalUnit) | Out-Null
     for ($i = 0; $i -lt 60; $i++) {
       Start-Sleep -Seconds 1
       $state = Get-ContainerState
-      if ($state -ne 'down') { break }
+      if ($state -ne 'inactive') { break }
     }
-    if ($state -eq 'down') { throw "$Unit did not recover within 60 seconds" }
+    if ($state -eq 'inactive') { throw "$CanonicalUnit did not recover within 60 seconds" }
   }
 
   Write-Log "container state=$state"
-  Publish-Snapshot
-  Mirror-EncryptedSnapshots
+  Publish-Snapshot -BridgeRoot $bridgeRoot
+  Mirror-EncryptedSnapshots -BridgeRoot $bridgeRoot
   exit 0
 } catch {
   Write-Log "FAILED: $($_.Exception.Message)"
