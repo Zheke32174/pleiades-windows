@@ -95,7 +95,7 @@ function Invoke-Case([string]$Name) {
     }
     'extra-event' {
       $raw = '{"schema":"pleiades.status/v1","container":"running","timestamp":1700000000,"ledger":{"state":"VALID","records":0},"agents":[],"events":[{"seq":1,"timestamp":1700000000,"digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","event":"first event","extra":"ambient"}]}'
-      Expect-Failure { & $supervisor -Root $testRoot -ValidateSnapshotJson $raw | Out-Null } 'snapshot.events[] must contain exactly'
+      Expect-Failure { & $supervisor -Root $testRoot -ValidateSnapshotJson $raw | Out-Null } 'must contain exactly: seq, timestamp, digest, event'
     }
     'bad-digest' {
       $value = Running-Snapshot; $value.events[0].digest = 'not-a-digest'
