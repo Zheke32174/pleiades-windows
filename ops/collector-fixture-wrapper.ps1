@@ -13,11 +13,12 @@ $script:FixtureEvents = @(Get-Content -LiteralPath $Fixture -Raw -Encoding utf8 
 $script:StateBroken = $false
 
 function New-FixtureEvent([object]$Item) {
+  [int64]$recordId = $Item.record_id
   $event = [pscustomobject]@{
-    RecordId = [int64]$Item.record_id
+    RecordId = $recordId
     Id = [int]$Item.event_id
     MachineName = "$($Item.machine)"
-    TimeCreated = [datetime]::Parse("$($Item.time)").ToUniversalTime()
+    TimeCreated = [datetime]::UnixEpoch.AddSeconds(1_750_000_000 + $recordId)
     Data = $Item.data
   }
   $event | Add-Member -MemberType ScriptMethod -Name ToXml -Value {
