@@ -14,7 +14,11 @@ param(
   [switch]$ValidateConfigurationOnly,
   [string]$ValidateSnapshotJson,
   [ValidateSet('down', 'running', 'degraded')]
-  [string]$ExpectedSnapshotContainerState
+  [string]$ExpectedSnapshotContainerState,
+  [long]$ValidateSnapshotReferenceUnixTime = 0,
+  [string]$TestSnapshotPublicationPath,
+  [string]$TestSnapshotPublicationJson,
+  [long]$TestSnapshotReferenceUnixTime = 0
 )
 
 $ErrorActionPreference = 'Stop'
@@ -26,6 +30,8 @@ $MaxSnapshotCollectionItems = 4096
 $MaxAgentProperties = 64
 $MaxAgentDepth = 6
 $MaxAgentStringLength = 4096
+$MaxSnapshotAgeSeconds = 300L
+$MaxSnapshotFutureSkewSeconds = 60L
 
 function Assert-Configuration {
   if ($Distro -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$') {
@@ -60,6 +66,14 @@ function Assert-PosixPath([string]$Name, [string]$Value) {
   }
   if ($Value -eq '/') { throw "$Name must not be the filesystem root" }
   return $Value.TrimEnd('/')
+}
+
+function Assert-NotReparsePoint([string]$Path, [string]$Label) {
+  $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+  if ($null -ne $item -and
+      (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+    throw "$Label must not be a reparse point: $Path"
+  }
 }
 
 function Get-RequiredJsonProperty([pscustomobject]$Object, [string]$Name) {
@@ -155,7 +169,8 @@ function Assert-BoundedAgentValue(
 
 function ConvertFrom-ValidatedSnapshot(
   [string]$Raw,
-  [string]$ExpectedContainerState
+  [string]$ExpectedContainerState,
+  [long]$ReferenceUnixTime = 0
 ) {
   if ([string]::IsNullOrWhiteSpace($Raw)) {
     throw 'snapshot JSON is empty'
@@ -211,6 +226,15 @@ function ConvertFrom-ValidatedSnapshot(
   $timestamp = (Get-RequiredJsonProperty $parsed 'timestamp').Value
   if (($timestamp -isnot [int] -and $timestamp -isnot [long]) -or $timestamp -lt 1) {
     throw 'snapshot timestamp must be a positive integer scalar'
+  }
+  $timestamp = [long]$timestamp
+  if ($ReferenceUnixTime -gt 0) {
+    if ($timestamp -lt ($ReferenceUnixTime - $MaxSnapshotAgeSeconds)) {
+      throw 'snapshot timestamp is stale relative to the independent observation time'
+    }
+    if ($timestamp -gt ($ReferenceUnixTime + $MaxSnapshotFutureSkewSeconds)) {
+      throw 'snapshot timestamp is unreasonably in the future'
+    }
   }
 
   $ledger = (Get-RequiredJsonProperty $parsed 'ledger').Value
@@ -273,6 +297,9 @@ function ConvertFrom-ValidatedSnapshot(
     $lastSequence = [long]$sequence
     if (($eventTimestamp -isnot [int] -and $eventTimestamp -isnot [long]) -or $eventTimestamp -lt 1) {
       throw 'snapshot event.timestamp must be a positive integer'
+    }
+    if ([long]$eventTimestamp -gt $timestamp) {
+      throw 'snapshot event.timestamp must not be later than the snapshot timestamp'
     }
     if ($digest -isnot [string] -or $digest -notmatch '^[0-9a-f]{64}$') {
       throw 'snapshot event.digest must be one lowercase SHA-256 scalar'
@@ -366,7 +393,10 @@ function Get-ContainerState {
 function Write-AtomicUtf8([string]$Path, [string]$Text) {
   $directory = Split-Path -Parent $Path
   $name = Split-Path -Leaf $Path
+  Assert-NotReparsePoint -Path $directory -Label 'atomic-write directory'
+  Assert-NotReparsePoint -Path $Path -Label 'atomic-write destination'
   $temporary = Join-Path $directory ".$name.tmp.$PID.$([Guid]::NewGuid().ToString('N'))"
+  $backup = Join-Path $directory ".$name.backup.$PID.$([Guid]::NewGuid().ToString('N'))"
   $bytes = [Text.UTF8Encoding]::new($false).GetBytes($Text)
   $stream = [IO.FileStream]::new(
     $temporary,
@@ -382,7 +412,8 @@ function Write-AtomicUtf8([string]$Path, [string]$Text) {
   }
   try {
     if (Test-Path -LiteralPath $Path) {
-      [IO.File]::Replace($temporary, $Path, $null, $true)
+      [IO.File]::Replace($temporary, $Path, $backup, $true)
+      Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
     } else {
       [IO.File]::Move($temporary, $Path)
     }
@@ -390,6 +421,45 @@ function Write-AtomicUtf8([string]$Path, [string]$Text) {
     Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
     throw
   }
+}
+
+function Test-SnapshotAdvance(
+  [string]$Destination,
+  [string]$IncomingRaw,
+  [pscustomobject]$Incoming
+) {
+  if (-not (Test-Path -LiteralPath $Destination)) { return $false }
+  Assert-NotReparsePoint -Path $Destination -Label 'published snapshot'
+  $item = Get-Item -LiteralPath $Destination -Force
+  if ($item.Length -lt 2 -or $item.Length -gt $MaxSnapshotBytes) {
+    throw 'existing status snapshot size is outside the accepted bound'
+  }
+  $strictUtf8 = [Text.UTF8Encoding]::new($false, $true)
+  $existingRaw = [IO.File]::ReadAllText($Destination, $strictUtf8)
+  $existing = ConvertFrom-ValidatedSnapshot -Raw $existingRaw -ExpectedContainerState ''
+  $incomingTimestamp = [long]$Incoming.timestamp
+  $existingTimestamp = [long]$existing.timestamp
+  if ($incomingTimestamp -lt $existingTimestamp) {
+    throw "snapshot timestamp rollback: existing=$existingTimestamp incoming=$incomingTimestamp"
+  }
+  if ($incomingTimestamp -eq $existingTimestamp) {
+    if ($IncomingRaw.Trim() -cne $existingRaw.Trim()) {
+      throw "equal snapshot timestamp carries different content: $incomingTimestamp"
+    }
+    return $true
+  }
+  return $false
+}
+
+function Publish-ValidatedSnapshot(
+  [string]$Destination,
+  [string]$Raw,
+  [pscustomobject]$Parsed
+) {
+  $exactRetry = Test-SnapshotAdvance -Destination $Destination -IncomingRaw $Raw -Incoming $Parsed
+  if ($exactRetry) { return 'exact-retry' }
+  Write-AtomicUtf8 -Path $Destination -Text ($Raw.Trim() + "`n")
+  return 'published'
 }
 
 function Publish-Snapshot(
@@ -403,10 +473,19 @@ function Publish-Snapshot(
   if ($byteCount -lt 2 -or $byteCount -gt $MaxSnapshotBytes) {
     throw "snapshot size is outside the accepted bound: $byteCount bytes"
   }
-  $parsed = ConvertFrom-ValidatedSnapshot -Raw $raw -ExpectedContainerState $ExpectedContainerState
-
+  $observedAt = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+  $validationArguments = @{
+    Raw = $raw
+    ExpectedContainerState = $ExpectedContainerState
+    ReferenceUnixTime = $observedAt
+  }
+  $parsed = ConvertFrom-ValidatedSnapshot @validationArguments
   $destination = Join-Path $portalDir 'status.json'
-  Write-AtomicUtf8 -Path $destination -Text ($raw + "`n")
+  $outcome = Publish-ValidatedSnapshot -Destination $destination -Raw $raw -Parsed $parsed
+  if ($outcome -eq 'exact-retry') {
+    Write-Log "snapshot exact retry retained (timestamp=$($parsed.timestamp))"
+    return
+  }
   Write-Log "snapshot published ($byteCount bytes, container=$($parsed.container), ledger=$($parsed.ledger.state))"
 }
 
@@ -447,9 +526,54 @@ if ($PSBoundParameters.ContainsKey('ExpectedSnapshotContainerState') -and
     -not $PSBoundParameters.ContainsKey('ValidateSnapshotJson')) {
   throw 'ExpectedSnapshotContainerState is valid only with ValidateSnapshotJson'
 }
+if ($PSBoundParameters.ContainsKey('ValidateSnapshotReferenceUnixTime') -and
+    -not $PSBoundParameters.ContainsKey('ValidateSnapshotJson')) {
+  throw 'ValidateSnapshotReferenceUnixTime is valid only with ValidateSnapshotJson'
+}
+$testPathBound = $PSBoundParameters.ContainsKey('TestSnapshotPublicationPath')
+$testJsonBound = $PSBoundParameters.ContainsKey('TestSnapshotPublicationJson')
+$testReferenceBound = $PSBoundParameters.ContainsKey('TestSnapshotReferenceUnixTime')
+if ($testPathBound -xor $testJsonBound) {
+  throw 'TestSnapshotPublicationPath and TestSnapshotPublicationJson must be supplied together'
+}
+if ($testReferenceBound -and -not ($testPathBound -and $testJsonBound)) {
+  throw 'TestSnapshotReferenceUnixTime requires snapshot publication fixture mode'
+}
+if (($testPathBound -or $testJsonBound) -and $env:PLEIADES_WINDOWS_TEST_MODE -cne '1') {
+  throw 'snapshot publication fixture mode requires PLEIADES_WINDOWS_TEST_MODE=1'
+}
+if (($testPathBound -or $testJsonBound) -and
+    ($PSBoundParameters.ContainsKey('ValidateSnapshotJson') -or $ValidateConfigurationOnly)) {
+  throw 'snapshot publication fixture mode cannot be combined with another validation mode'
+}
+if ($testPathBound -and $testJsonBound) {
+  $testDirectory = Split-Path -Parent $TestSnapshotPublicationPath
+  Assert-NotReparsePoint -Path $testDirectory -Label 'snapshot fixture directory'
+  $null = New-Item -ItemType Directory -Force -Path $testDirectory
+  Assert-NotReparsePoint -Path $testDirectory -Label 'snapshot fixture directory'
+  $fixtureValidation = @{
+    Raw = $TestSnapshotPublicationJson
+    ExpectedContainerState = ''
+    ReferenceUnixTime = $TestSnapshotReferenceUnixTime
+  }
+  $fixtureParsed = ConvertFrom-ValidatedSnapshot @fixtureValidation
+  $publicationArguments = @{
+    Destination = $TestSnapshotPublicationPath
+    Raw = $TestSnapshotPublicationJson
+    Parsed = $fixtureParsed
+  }
+  $fixtureOutcome = Publish-ValidatedSnapshot @publicationArguments
+  Write-Output "snapshot publication fixture: $fixtureOutcome"
+  exit 0
+}
 if ($PSBoundParameters.ContainsKey('ValidateSnapshotJson')) {
-  ConvertFrom-ValidatedSnapshot -Raw $ValidateSnapshotJson -ExpectedContainerState $ExpectedSnapshotContainerState | Out-Null
-  Write-Output 'snapshot JSON is valid, exact, and bounded'
+  $validationArguments = @{
+    Raw = $ValidateSnapshotJson
+    ExpectedContainerState = $ExpectedSnapshotContainerState
+    ReferenceUnixTime = $ValidateSnapshotReferenceUnixTime
+  }
+  ConvertFrom-ValidatedSnapshot @validationArguments | Out-Null
+  Write-Output 'snapshot JSON is valid, exact, bounded, and temporally coherent'
   exit 0
 }
 if ($ValidateConfigurationOnly) {
@@ -460,7 +584,11 @@ if ($ValidateConfigurationOnly) {
 $stateDir = Join-Path $Root 'state'
 $portalDir = Join-Path $Root 'portal'
 $backupDir = Join-Path $Root 'backup'
+Assert-NotReparsePoint -Path $Root -Label 'managed runtime root'
 $null = New-Item -ItemType Directory -Force -Path $stateDir, $portalDir, $backupDir
+foreach ($directory in $Root, $stateDir, $portalDir, $backupDir) {
+  Assert-NotReparsePoint -Path $directory -Label 'managed runtime directory'
+}
 $logPath = Join-Path $stateDir 'supervisor.log'
 
 function Write-Log([string]$Message) {

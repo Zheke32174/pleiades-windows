@@ -6,6 +6,8 @@ on:
       - 'bin/pleiades-supervisor.ps1'
       - 'bin/pleiades-snapshot.sh'
       - 'ops/test-status-snapshot.ps1'
+      - 'ops/test-status-publication.ps1'
+      - 'tests/test-snapshot-ledger-state.sh'
       - '.github/workflows/status-contract.yml'
   push:
     branches: [main]
@@ -13,6 +15,8 @@ on:
       - 'bin/pleiades-supervisor.ps1'
       - 'bin/pleiades-snapshot.sh'
       - 'ops/test-status-snapshot.ps1'
+      - 'ops/test-status-publication.ps1'
+      - 'tests/test-snapshot-ledger-state.sh'
       - '.github/workflows/status-contract.yml'
 
 permissions:
@@ -32,6 +36,7 @@ jobs:
         case:
           - valid-running
           - valid-down
+          - valid-fresh
           - extra-top
           - extra-ledger
           - extra-event
@@ -42,14 +47,22 @@ jobs:
           - down-with-evidence
           - state-mismatch
           - duplicate-key
+          - stale-snapshot
+          - future-snapshot
+          - future-event
           - invalid-validation-mode
+          - invalid-reference-mode
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
       - name: Parse PowerShell status surfaces
         shell: pwsh
         run: |
           $failures = @()
-          foreach ($path in 'bin/pleiades-supervisor.ps1','ops/test-status-snapshot.ps1') {
+          foreach ($path in @(
+            'bin/pleiades-supervisor.ps1',
+            'ops/test-status-snapshot.ps1',
+            'ops/test-status-publication.ps1'
+          )) {
             $tokens = $null
             $errors = $null
             [void][System.Management.Automation.Language.Parser]::ParseFile(
@@ -67,11 +80,51 @@ jobs:
         shell: pwsh
         run: ./ops/test-status-snapshot.ps1 -Case '${{ matrix.case }}'
 
+  status-publication:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - name: Parse publication fixture
+        shell: pwsh
+        run: |
+          $failures = @()
+          foreach ($path in 'bin/pleiades-supervisor.ps1','ops/test-status-publication.ps1') {
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path -LiteralPath $path),
+              [ref]$tokens,
+              [ref]$errors
+            )
+            foreach ($errorItem in @($errors)) {
+              $failures += "$path`:$($errorItem.Extent.StartLineNumber): $($errorItem.Message)"
+            }
+          }
+          $failures | ForEach-Object { Write-Error $_ }
+          if ($failures.Count -gt 0) { throw "PowerShell parse failures: $($failures.Count)" }
+      - name: Exercise replacement, rollback, collision, freshness, and reparse refusal
+        shell: pwsh
+        run: ./ops/test-status-publication.ps1
+
+  producer-ledger-state:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - name: Parse producer and fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n bin/pleiades-snapshot.sh
+          bash -n tests/test-snapshot-ledger-state.sh
+      - name: Exercise exact verifier outcome mapping and read stability
+        shell: bash
+        run: bash tests/test-snapshot-ledger-state.sh
+
   schema-identity:
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-      - name: Enforce producer and consumer schema identity
+      - name: Enforce producer and consumer status boundaries
         shell: pwsh
         run: |
           $producer = Get-Content -LiteralPath bin/pleiades-snapshot.sh -Raw
@@ -80,3 +133,13 @@ jobs:
           if (-not $consumer.Contains("'pleiades.status/v1'")) { throw 'consumer schema identity missing' }
           if (-not $consumer.Contains('Assert-NoDuplicateJsonProperties')) { throw 'duplicate-key validation missing' }
           if (-not $consumer.Contains('Assert-ExactJsonProperties')) { throw 'exact-object validation missing' }
+          if (-not $consumer.Contains('snapshot timestamp rollback')) { throw 'snapshot rollback refusal missing' }
+          if (-not $consumer.Contains('[IO.File]::Replace($temporary, $Path, $backup, $true)')) {
+            throw 'same-directory replacement backup is missing'
+          }
+          if ($producer.Contains("*'VALID'*") -or $producer.Contains('*VALID*')) {
+            throw 'substring-based verifier success classification remains present'
+          }
+          if (-not $producer.Contains('before_text == after_text')) {
+            throw 'double-verifier stability binding is missing'
+          }
