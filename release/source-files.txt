@@ -1,4 +1,5 @@
 .github/workflows/ci.yml
+.github/workflows/collector-fixture.yml
 .github/workflows/release.yml
 .gitignore
 CHANGELOG.md
@@ -15,7 +16,10 @@ bin/pleiades-netwatch.ps1
 bin/pleiades-snapshot.sh
 bin/pleiades-supervisor.ps1
 ci/scan_public_repo.py
+ops/collector-fixture-wrapper.ps1
 ops/install-windows.ps1
+ops/test-collector-baseline.ps1
+ops/test-collector-replay.ps1
 ops/test-install-windows.ps1
 ops/uninstall-windows.ps1
 ops/verify-windows.ps1
