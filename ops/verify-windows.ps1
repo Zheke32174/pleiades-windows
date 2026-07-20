@@ -110,15 +110,28 @@ Check 'supervisor bounds snapshot output and uses atomic publication' {
   return $supervisorSource.Contains('$MaxSnapshotBytes = 2MB') -and
     $supervisorSource.Contains('$MaxSnapshotCollectionItems = 4096') -and
     $supervisorSource.Contains('snapshot size is outside the accepted bound') -and
-    $supervisorSource.Contains('function Write-AtomicUtf8')
+    $supervisorSource.Contains('function Write-AtomicUtf8') -and
+    $supervisorSource.Contains('[IO.File]::Replace($temporary, $Path, $backup, $true)')
 }
 Check 'supervisor validates exact snapshot object and field shapes before publication' {
-  return $supervisorSource.Contains('snapshot top level must be exactly one JSON object') -and
-    $supervisorSource.Contains('snapshot schema must be the exact bounded scalar') -and
+  return $supervisorSource.Contains('function Assert-ExactJsonProperties') -and
+    $supervisorSource.Contains('function Assert-NoDuplicateJsonProperties') -and
+    $supervisorSource.Contains('function Assert-BoundedAgentValue') -and
+    $supervisorSource.Contains('snapshot top level must be exactly one JSON object') -and
+    $supervisorSource.Contains('snapshot schema must be the exact scalar pleiades.status/v1') -and
     $supervisorSource.Contains('snapshot ledger must be exactly one object') -and
-    $supervisorSource.Contains("foreach (`$field in 'agents', 'events')") -and
-    $supervisorSource.Contains('snapshot $field must be an array') -and
-    $supervisorSource.Contains('snapshot $field entries must be objects')
+    $supervisorSource.Contains("foreach (`$arrayName in 'agents', 'events')") -and
+    $supervisorSource.Contains('snapshot $arrayName must be a JSON array') -and
+    $supervisorSource.Contains('snapshot agents entries must be objects') -and
+    $supervisorSource.Contains('snapshot events entries must be objects') -and
+    $supervisorSource.Contains('snapshot events must use strictly increasing unique sequence values')
+}
+Check 'supervisor enforces fresh monotonic status publication' {
+  return $supervisorSource.Contains('$MaxSnapshotAgeSeconds = 300L') -and
+    $supervisorSource.Contains('snapshot timestamp is stale relative to the independent observation time') -and
+    $supervisorSource.Contains('snapshot timestamp rollback') -and
+    $supervisorSource.Contains('equal snapshot timestamp carries different content') -and
+    $supervisorSource.Contains("Assert-NotReparsePoint -Path `$Destination -Label 'published snapshot'")
 }
 Check 'supervisor passes mirror paths as argv to fixed script logic' {
   return $supervisorSource.Contains('function Invoke-WslScript') -and
