@@ -64,6 +64,6 @@ function global:Get-WinEvent {
   return $selected
 }
 
-$arguments = @('-Root', $Root)
-if ($AcceptLogReset) { $arguments += '-AcceptLogReset' }
-& $Collector @arguments
+$collectorArguments = @{ Root = $Root }
+if ($AcceptLogReset) { $collectorArguments.AcceptLogReset = $true }
+& $Collector @collectorArguments
