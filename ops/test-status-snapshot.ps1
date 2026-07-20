@@ -79,7 +79,7 @@ function Invoke-Case([string]$Name) {
       Expect-Failure { & $supervisor -Root $testRoot -ValidateSnapshotJson (Compact-Json $value) | Out-Null } 'snapshot.ledger must contain exactly'
     }
     'extra-event' {
-      $value = Running-Snapshot; $value.events[0].extra = 'ambient'
+      $value = Running-Snapshot; $value.events[0]['extra'] = 'ambient'
       Expect-Failure { & $supervisor -Root $testRoot -ValidateSnapshotJson (Compact-Json $value) | Out-Null } 'snapshot.events[] must contain exactly'
     }
     'bad-digest' {
