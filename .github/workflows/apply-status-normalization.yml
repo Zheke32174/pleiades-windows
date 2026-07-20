@@ -1,0 +1,88 @@
+name: Apply status collection normalization
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/apply-status-normalization.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.head_ref == 'contracts/exact-status-snapshot-v1'
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+      - name: Apply exact collection identity repair
+        shell: pwsh
+        run: |
+          $path = 'bin/pleiades-supervisor.ps1'
+          $text = Get-Content -LiteralPath $path -Raw
+          $oldDocument = @'
+              $document = [System.Text.Json.JsonDocument]::Parse($trimmed)
+              Assert-NoDuplicateJsonProperties -Element $document.RootElement -Path '$'
+          '@.Trim()
+          $newDocument = @'
+              $document = [System.Text.Json.JsonDocument]::Parse($trimmed)
+              Assert-NoDuplicateJsonProperties -Element $document.RootElement -Path '$'
+              foreach ($arrayName in 'agents', 'events') {
+                $arrayElement = $document.RootElement.GetProperty($arrayName)
+                if ($arrayElement.ValueKind -ne [System.Text.Json.JsonValueKind]::Array) {
+                  throw "snapshot $arrayName must be a JSON array"
+                }
+              }
+          '@.Trim()
+          $oldCollections = @'
+            $agents = @((Get-RequiredJsonProperty $parsed 'agents').Value)
+            $events = @((Get-RequiredJsonProperty $parsed 'events').Value)
+            foreach ($field in 'agents', 'events') {
+              $collection = if ($field -eq 'agents') { $agents } else { $events }
+              if ($collection -isnot [System.Array]) {
+                throw "snapshot $field must be an array"
+              }
+              if ($collection.Count -gt $MaxSnapshotCollectionItems) {
+                throw "snapshot $field exceeds $MaxSnapshotCollectionItems items"
+              }
+            }
+          '@.Trim()
+          $newCollections = @'
+            $agents = @((Get-RequiredJsonProperty $parsed 'agents').Value)
+            $events = @((Get-RequiredJsonProperty $parsed 'events').Value)
+            if ($agents.Count -gt $MaxSnapshotCollectionItems) {
+              throw "snapshot agents exceeds $MaxSnapshotCollectionItems items"
+            }
+            if ($events.Count -gt $MaxSnapshotCollectionItems) {
+              throw "snapshot events exceeds $MaxSnapshotCollectionItems items"
+            }
+          '@.Trim()
+          if (-not $text.Contains($oldDocument)) { throw 'document identity target not found exactly' }
+          if (-not $text.Contains($oldCollections)) { throw 'collection normalization target not found exactly' }
+          $text = $text.Replace($oldDocument, $newDocument).Replace($oldCollections, $newCollections)
+          Set-Content -LiteralPath $path -Value $text -Encoding utf8NoBOM -NoNewline
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path -LiteralPath $path), [ref]$tokens, [ref]$errors
+          )
+          if (@($errors).Count -gt 0) {
+            @($errors) | ForEach-Object { Write-Error $_.Message }
+            throw 'normalized supervisor does not parse'
+          }
+      - name: Commit only the normalized supervisor
+        env:
+          HEAD_BRANCH: ${{ github.head_ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git diff --name-only | sort)" = 'bin/pleiades-supervisor.ps1'
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- bin/pleiades-supervisor.ps1
+          git commit -m 'Preserve status collection identity'
+          git push origin "HEAD:${HEAD_BRANCH}"
