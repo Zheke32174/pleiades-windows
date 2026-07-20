@@ -18,7 +18,7 @@ function New-FixtureEvent([object]$Item) {
     RecordId = $recordId
     Id = [int]$Item.event_id
     MachineName = "$($Item.machine)"
-    TimeCreated = [datetime]::UnixEpoch.AddSeconds(1_750_000_000 + $recordId)
+    TimeCreated = [datetime]::UnixEpoch.AddSeconds(1750000000 + $recordId)
     Data = $Item.data
   }
   $event | Add-Member -MemberType ScriptMethod -Name ToXml -Value {
