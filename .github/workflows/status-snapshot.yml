@@ -1,0 +1,54 @@
+name: Status snapshot boundary
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: status-snapshot-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate-status-snapshot:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          show-progress: false
+
+      - name: Parse changed PowerShell
+        shell: pwsh
+        run: |
+          $failures = @()
+          foreach ($path in 'bin/pleiades-supervisor.ps1','ops/test-status-snapshot.ps1') {
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+              (Join-Path $PWD $path),
+              [ref]$tokens,
+              [ref]$errors
+            )
+            foreach ($errorItem in @($errors)) {
+              $failures += "${path}:$($errorItem.Extent.StartLineNumber): $($errorItem.Message)"
+            }
+          }
+          $failures | ForEach-Object { Write-Error $_ }
+          if ($failures.Count -gt 0) { throw "PowerShell parse failures: $($failures.Count)" }
+
+      - name: Run malformed snapshot fixtures
+        shell: pwsh
+        run: ./ops/test-status-snapshot.ps1
+
+      - name: Confirm validation precedes publication
+        shell: pwsh
+        run: |
+          $source = Get-Content ./bin/pleiades-supervisor.ps1 -Raw
+          $validateAt = $source.IndexOf('$parsed = Assert-StatusSnapshot -Raw $raw')
+          $publishAt = $source.IndexOf('Write-AtomicUtf8 -Path $destination')
+          if ($validateAt -lt 0 -or $publishAt -le $validateAt) {
+            throw 'status publication is not gated by typed validation'
+          }
