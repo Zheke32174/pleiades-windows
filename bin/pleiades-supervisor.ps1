@@ -11,7 +11,8 @@ param(
   [string]$Distro = 'Ubuntu',
   [string]$Machine = 'pleiades',
   [string]$Unit = 'pleiades-container.service',
-  [switch]$ValidateConfigurationOnly
+  [switch]$ValidateConfigurationOnly,
+  [string]$ValidateSnapshotJson
 )
 
 $ErrorActionPreference = 'Stop'
@@ -19,6 +20,7 @@ $env:WSL_UTF8 = '1'
 $CanonicalMachine = 'pleiades'
 $CanonicalUnit = 'pleiades-container.service'
 $MaxSnapshotBytes = 2MB
+$MaxSnapshotCollectionItems = 4096
 
 function Assert-Configuration {
   if ($Distro -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$') {
@@ -53,6 +55,80 @@ function Assert-PosixPath([string]$Name, [string]$Value) {
   }
   if ($Value -eq '/') { throw "$Name must not be the filesystem root" }
   return $Value.TrimEnd('/')
+}
+
+function Get-RequiredJsonProperty([pscustomobject]$Object, [string]$Name) {
+  $property = $Object.PSObject.Properties[$Name]
+  if ($null -eq $property) {
+    throw "snapshot is missing required field: $Name"
+  }
+  return $property
+}
+
+function ConvertFrom-ValidatedSnapshot([string]$Raw) {
+  if ([string]::IsNullOrWhiteSpace($Raw)) {
+    throw 'snapshot JSON is empty'
+  }
+
+  $trimmed = $Raw.Trim()
+  if ($trimmed.Length -lt 2 -or $trimmed[0] -ne '{' -or $trimmed[$trimmed.Length - 1] -ne '}') {
+    throw 'snapshot top level must be exactly one JSON object'
+  }
+
+  try {
+    $parsed = $trimmed | ConvertFrom-Json -ErrorAction Stop
+  } catch {
+    throw "snapshot is not valid JSON: $($_.Exception.Message)"
+  }
+  if ($null -eq $parsed -or $parsed -is [Array] -or $parsed -isnot [pscustomobject]) {
+    throw 'snapshot top level must be exactly one JSON object'
+  }
+
+  $schema = (Get-RequiredJsonProperty $parsed 'schema').Value
+  if ($schema -isnot [string] -or $schema.Length -gt 64 -or $schema -cne 'pleiades.status/v1') {
+    throw 'snapshot schema must be the exact bounded scalar pleiades.status/v1'
+  }
+
+  $container = (Get-RequiredJsonProperty $parsed 'container').Value
+  if ($container -isnot [string] -or $container.Length -gt 16 -or $container -notin 'running', 'degraded') {
+    throw 'snapshot container must be one bounded running/degraded scalar'
+  }
+
+  $timestamp = (Get-RequiredJsonProperty $parsed 'timestamp').Value
+  if (($timestamp -isnot [int] -and $timestamp -isnot [long]) -or $timestamp -lt 1) {
+    throw 'snapshot timestamp must be a positive integer scalar'
+  }
+
+  $ledger = (Get-RequiredJsonProperty $parsed 'ledger').Value
+  if ($null -eq $ledger -or $ledger -is [Array] -or $ledger -isnot [pscustomobject]) {
+    throw 'snapshot ledger must be exactly one object'
+  }
+  $ledgerState = (Get-RequiredJsonProperty $ledger 'state').Value
+  if ($ledgerState -isnot [string] -or $ledgerState.Length -lt 1 -or $ledgerState.Length -gt 32 -or
+      $ledgerState -notin 'VALID', 'EMPTY', 'MISSING', 'TAMPERED', 'ERROR', 'UNKNOWN') {
+    throw 'snapshot ledger.state must be one bounded recognized scalar'
+  }
+  $ledgerRecords = (Get-RequiredJsonProperty $ledger 'records').Value
+  if (($ledgerRecords -isnot [int] -and $ledgerRecords -isnot [long]) -or $ledgerRecords -lt 0) {
+    throw 'snapshot ledger.records must be a nonnegative integer scalar'
+  }
+
+  foreach ($field in 'agents', 'events') {
+    $collection = (Get-RequiredJsonProperty $parsed $field).Value
+    if ($collection -isnot [System.Array]) {
+      throw "snapshot $field must be an array"
+    }
+    if ($collection.Count -gt $MaxSnapshotCollectionItems) {
+      throw "snapshot $field exceeds $MaxSnapshotCollectionItems items"
+    }
+    foreach ($item in $collection) {
+      if ($null -eq $item -or $item -is [Array] -or $item -isnot [pscustomobject]) {
+        throw "snapshot $field entries must be objects"
+      }
+    }
+  }
+
+  return $parsed
 }
 
 function Invoke-WslTyped(
@@ -162,13 +238,7 @@ function Publish-Snapshot([string]$BridgeRoot) {
   if ($byteCount -lt 2 -or $byteCount -gt $MaxSnapshotBytes) {
     throw "snapshot size is outside the accepted bound: $byteCount bytes"
   }
-  $parsed = $raw | ConvertFrom-Json -ErrorAction Stop
-  if ($parsed.schema -ne 'pleiades.status/v1') {
-    throw "unexpected snapshot schema: $($parsed.schema)"
-  }
-  if ("$($parsed.container)" -notin 'running', 'degraded') {
-    throw "unexpected snapshot container state: $($parsed.container)"
-  }
+  $parsed = ConvertFrom-ValidatedSnapshot -Raw $raw
 
   $destination = Join-Path $portalDir 'status.json'
   Write-AtomicUtf8 -Path $destination -Text ($raw + "`n")
@@ -208,6 +278,11 @@ find "$src" -maxdepth 1 -type f \( -name 'maia-*.enc' -o -name 'maia-*.sig' \) -
 }
 
 Assert-Configuration
+if ($PSBoundParameters.ContainsKey('ValidateSnapshotJson')) {
+  ConvertFrom-ValidatedSnapshot -Raw $ValidateSnapshotJson | Out-Null
+  Write-Output 'snapshot JSON is valid and bounded'
+  exit 0
+}
 if ($ValidateConfigurationOnly) {
   Write-Output "configuration valid: distro=$Distro machine=$CanonicalMachine unit=$CanonicalUnit root=$Root"
   exit 0
