@@ -170,6 +170,12 @@ function ConvertFrom-ValidatedSnapshot(
   try {
     $document = [System.Text.Json.JsonDocument]::Parse($trimmed)
     Assert-NoDuplicateJsonProperties -Element $document.RootElement -Path '$'
+    foreach ($arrayName in 'agents', 'events') {
+      $arrayElement = $document.RootElement.GetProperty($arrayName)
+      if ($arrayElement.ValueKind -ne [System.Text.Json.JsonValueKind]::Array) {
+        throw "snapshot $arrayName must be a JSON array"
+      }
+    }
   } catch {
     throw "snapshot JSON object identity is invalid: $($_.Exception.Message)"
   } finally {
@@ -224,14 +230,11 @@ function ConvertFrom-ValidatedSnapshot(
 
   $agents = @((Get-RequiredJsonProperty $parsed 'agents').Value)
   $events = @((Get-RequiredJsonProperty $parsed 'events').Value)
-  foreach ($field in 'agents', 'events') {
-    $collection = if ($field -eq 'agents') { $agents } else { $events }
-    if ($collection -isnot [System.Array]) {
-      throw "snapshot $field must be an array"
-    }
-    if ($collection.Count -gt $MaxSnapshotCollectionItems) {
-      throw "snapshot $field exceeds $MaxSnapshotCollectionItems items"
-    }
+  if ($agents.Count -gt $MaxSnapshotCollectionItems) {
+    throw "snapshot agents exceeds $MaxSnapshotCollectionItems items"
+  }
+  if ($events.Count -gt $MaxSnapshotCollectionItems) {
+    throw "snapshot events exceeds $MaxSnapshotCollectionItems items"
   }
 
   foreach ($agent in $agents) {
