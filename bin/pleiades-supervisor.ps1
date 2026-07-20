@@ -222,8 +222,8 @@ function ConvertFrom-ValidatedSnapshot(
     throw 'snapshot ledger.records must be a nonnegative integer scalar'
   }
 
-  $agents = (Get-RequiredJsonProperty $parsed 'agents').Value
-  $events = (Get-RequiredJsonProperty $parsed 'events').Value
+  $agents = @((Get-RequiredJsonProperty $parsed 'agents').Value)
+  $events = @((Get-RequiredJsonProperty $parsed 'events').Value)
   foreach ($field in 'agents', 'events') {
     $collection = if ($field -eq 'agents') { $agents } else { $events }
     if ($collection -isnot [System.Array]) {
