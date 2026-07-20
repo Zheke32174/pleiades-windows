@@ -2,14 +2,32 @@
 param(
   [Parameter(Mandatory)][string]$Collector,
   [Parameter(Mandatory)][string]$Root,
-  [Parameter(Mandatory)][string]$Fixture,
   [switch]$AcceptLogReset,
   [switch]$BreakStateOnQuery
 )
 
 $ErrorActionPreference = 'Stop'
 $script:FixtureRoot = $Root
-$script:FixtureEvents = @(Get-Content -LiteralPath $Fixture -Raw -Encoding utf8 | ConvertFrom-Json)
+$script:FixtureEvents = @(
+  [pscustomobject]@{
+    record_id = 10
+    event_id = 4625
+    machine = [Environment]::MachineName
+    data = [pscustomobject]@{
+      TargetUserName = 'alice'; TargetDomainName = 'PLEIADES'; IpAddress = '192.0.2.10'
+      WorkstationName = 'fixture-a'; LogonType = '3'; Status = '0xC000006D'; SubStatus = '0xC000006A'
+    }
+  },
+  [pscustomobject]@{
+    record_id = 11
+    event_id = 4720
+    machine = [Environment]::MachineName
+    data = [pscustomobject]@{
+      TargetUserName = 'bob'; TargetDomainName = 'PLEIADES'; IpAddress = '-'
+      WorkstationName = 'fixture-b'; LogonType = '-'; Status = '-'; SubStatus = '-'
+    }
+  }
+)
 $script:StateBroken = $false
 
 function New-FixtureEvent([object]$Item) {
