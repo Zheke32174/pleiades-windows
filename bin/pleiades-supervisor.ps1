@@ -11,7 +11,8 @@ param(
   [string]$Distro = 'Ubuntu',
   [string]$Machine = 'pleiades',
   [string]$Unit = 'pleiades-container.service',
-  [switch]$ValidateConfigurationOnly
+  [switch]$ValidateConfigurationOnly,
+  [string]$ValidateSnapshotPath
 )
 
 $ErrorActionPreference = 'Stop'
@@ -53,6 +54,70 @@ function Assert-PosixPath([string]$Name, [string]$Value) {
   }
   if ($Value -eq '/') { throw "$Name must not be the filesystem root" }
   return $Value.TrimEnd('/')
+}
+
+function Test-JsonInteger([object]$Value) {
+  return (
+    $Value -is [byte] -or
+    $Value -is [sbyte] -or
+    $Value -is [int16] -or
+    $Value -is [uint16] -or
+    $Value -is [int32] -or
+    $Value -is [uint32] -or
+    $Value -is [int64] -or
+    $Value -is [uint64]
+  )
+}
+
+function Assert-StatusSnapshot([string]$Raw) {
+  $trimmed = $Raw.Trim()
+  if (-not $trimmed.StartsWith('{') -or -not $trimmed.EndsWith('}')) {
+    throw 'snapshot top-level value must be exactly one JSON object'
+  }
+
+  $parsed = $trimmed | ConvertFrom-Json -ErrorAction Stop
+  if ($null -eq $parsed -or $parsed -is [System.Array] -or $parsed -isnot [pscustomobject]) {
+    throw 'snapshot top-level value must be exactly one JSON object'
+  }
+
+  $propertyNames = @($parsed.PSObject.Properties.Name)
+  foreach ($required in 'schema', 'container', 'timestamp', 'ledger', 'agents', 'events') {
+    if ($propertyNames -cnotcontains $required) {
+      throw "snapshot is missing required field: $required"
+    }
+  }
+
+  if ($parsed.schema -isnot [string] -or $parsed.schema -cne 'pleiades.status/v1') {
+    throw 'snapshot schema must be exactly pleiades.status/v1'
+  }
+  if ($parsed.container -isnot [string] -or $parsed.container -cnotin 'running', 'degraded') {
+    throw 'snapshot container state must be running or degraded'
+  }
+  if (-not (Test-JsonInteger $parsed.timestamp) -or [int64]$parsed.timestamp -lt 0) {
+    throw 'snapshot timestamp must be a non-negative integer'
+  }
+
+  if ($null -eq $parsed.ledger -or $parsed.ledger -is [System.Array] -or $parsed.ledger -isnot [pscustomobject]) {
+    throw 'snapshot ledger must be exactly one object'
+  }
+  $ledgerNames = @($parsed.ledger.PSObject.Properties.Name)
+  if ($ledgerNames -cnotcontains 'state' -or $ledgerNames -cnotcontains 'records') {
+    throw 'snapshot ledger must contain state and records'
+  }
+  if ($parsed.ledger.state -isnot [string] -or $parsed.ledger.state -cnotin 'VALID', 'EMPTY', 'MISSING', 'TAMPERED', 'ERROR', 'UNKNOWN') {
+    throw 'snapshot ledger state is invalid'
+  }
+  if (-not (Test-JsonInteger $parsed.ledger.records) -or [int64]$parsed.ledger.records -lt 0) {
+    throw 'snapshot ledger records must be a non-negative integer'
+  }
+  if ($parsed.agents -isnot [System.Array]) {
+    throw 'snapshot agents must be an array'
+  }
+  if ($parsed.events -isnot [System.Array]) {
+    throw 'snapshot events must be an array'
+  }
+
+  return $parsed
 }
 
 function Invoke-WslTyped(
@@ -162,13 +227,7 @@ function Publish-Snapshot([string]$BridgeRoot) {
   if ($byteCount -lt 2 -or $byteCount -gt $MaxSnapshotBytes) {
     throw "snapshot size is outside the accepted bound: $byteCount bytes"
   }
-  $parsed = $raw | ConvertFrom-Json -ErrorAction Stop
-  if ($parsed.schema -ne 'pleiades.status/v1') {
-    throw "unexpected snapshot schema: $($parsed.schema)"
-  }
-  if ("$($parsed.container)" -notin 'running', 'degraded') {
-    throw "unexpected snapshot container state: $($parsed.container)"
-  }
+  $parsed = Assert-StatusSnapshot -Raw $raw
 
   $destination = Join-Path $portalDir 'status.json'
   Write-AtomicUtf8 -Path $destination -Text ($raw + "`n")
@@ -211,6 +270,22 @@ Assert-Configuration
 if ($ValidateConfigurationOnly) {
   Write-Output "configuration valid: distro=$Distro machine=$CanonicalMachine unit=$CanonicalUnit root=$Root"
   exit 0
+}
+if (-not [string]::IsNullOrWhiteSpace($ValidateSnapshotPath)) {
+  try {
+    $snapshotItem = Get-Item -LiteralPath $ValidateSnapshotPath -Force
+    if (-not $snapshotItem.PSIsContainer -and $snapshotItem.Length -le $MaxSnapshotBytes) {
+      $strictUtf8 = [Text.UTF8Encoding]::new($false, $true)
+      $rawSnapshot = $strictUtf8.GetString([IO.File]::ReadAllBytes($snapshotItem.FullName))
+      Assert-StatusSnapshot -Raw $rawSnapshot | Out-Null
+      Write-Output 'snapshot valid: exactly one typed pleiades.status/v1 object'
+      exit 0
+    }
+    throw 'snapshot fixture must be one bounded regular file'
+  } catch {
+    Write-Error "snapshot validation failed: $($_.Exception.Message)"
+    exit 1
+  }
 }
 
 $stateDir = Join-Path $Root 'state'
