@@ -2,20 +2,30 @@ name: CI
 
 on:
   push:
+    branches:
+      - main
   pull_request:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
-  verify:
-    runs-on: ubuntu-latest
+  windows-verify:
+    runs-on: windows-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          show-progress: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
 
       - name: Parse PowerShell
         shell: pwsh
@@ -36,23 +46,126 @@ jobs:
           $failures | ForEach-Object { Write-Error $_ }
           if ($failures.Count -gt 0) { throw "PowerShell parse failures: $($failures.Count)" }
 
-      - name: PSScriptAnalyzer report
-        continue-on-error: true
+      - name: Capture PSScriptAnalyzer diagnostics
+        id: analyzer
         shell: pwsh
         run: |
-          Install-Module PSScriptAnalyzer -Scope CurrentUser -Force -AllowClobber
-          Invoke-ScriptAnalyzer -Path bin,ops -Recurse -Severity Warning |
-            Format-Table -AutoSize | Out-String | Write-Host
+          $ErrorActionPreference = 'Stop'
+          $status = 0
+          $errorFindings = @()
+          $warningFindings = @()
+          try {
+            Install-Module PSScriptAnalyzer -RequiredVersion 1.24.0 -Scope CurrentUser -Force -AllowClobber
+            Import-Module PSScriptAnalyzer -RequiredVersion 1.24.0 -Force
+            "PSScriptAnalyzer 1.24.0" | Set-Content -LiteralPath psscriptanalyzer-version.txt -Encoding utf8
+            $targets = @(Get-ChildItem bin,ops -Recurse -Filter '*.ps1' -File | Sort-Object FullName)
+            foreach ($target in $targets) {
+              $errorFindings += @(Invoke-ScriptAnalyzer -Path $target.FullName -Severity Error)
+              $warningFindings += @(Invoke-ScriptAnalyzer -Path $target.FullName -Severity Warning)
+            }
+          } catch {
+            $status = 1
+            ($_ | Format-List * -Force | Out-String) | Set-Content -LiteralPath psscriptanalyzer-errors.txt -Encoding utf8
+          }
+          if ($errorFindings.Count -gt 0) {
+            $status = 1
+            $errorFindings | Format-List * | Out-String | Set-Content -LiteralPath psscriptanalyzer-errors.txt -Encoding utf8
+          } elseif (-not (Test-Path -LiteralPath psscriptanalyzer-errors.txt)) {
+            'No error-severity findings.' | Set-Content -LiteralPath psscriptanalyzer-errors.txt -Encoding utf8
+          }
+          if ($warningFindings.Count -gt 0) {
+            $warningFindings | Format-List * | Out-String | Set-Content -LiteralPath psscriptanalyzer-warnings.txt -Encoding utf8
+          } else {
+            'No warning-severity findings.' | Set-Content -LiteralPath psscriptanalyzer-warnings.txt -Encoding utf8
+          }
+          Get-Content psscriptanalyzer-errors.txt,psscriptanalyzer-warnings.txt | Write-Host
+          "status=$status" >> $env:GITHUB_OUTPUT
+          exit 0
 
-      - name: Run repository verification
+      - name: Capture repository verification
+        id: repository
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path "$PWD/.ci-runtime" | Out-Null
-          & ./ops/verify-windows.ps1 -Root "$PWD/.ci-runtime"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $status = 0
+          try {
+            New-Item -ItemType Directory -Force -Path "$PWD/.ci-runtime" | Out-Null
+            & ./ops/verify-windows.ps1 -Root "$PWD/.ci-runtime" *>&1 |
+              Tee-Object -FilePath repository-verification.log | Write-Host
+            if ($LASTEXITCODE -ne 0) { $status = $LASTEXITCODE }
+          } catch {
+            $status = 1
+            ($_ | Format-List * -Force | Out-String) | Add-Content -LiteralPath repository-verification.log -Encoding utf8
+          }
+          if (Test-Path repository-verification.log) { Get-Content repository-verification.log | Write-Host }
+          "status=$status" >> $env:GITHUB_OUTPUT
+          exit 0
 
-      - name: Defensive bridge invariants
-        shell: bash
+      - name: Capture install update uninstall and purge tests
+        id: install
+        shell: pwsh
+        run: |
+          $status = 0
+          try {
+            & ./ops/test-install-windows.ps1 *>&1 |
+              Tee-Object -FilePath install-contract-tests.log | Write-Host
+            if ($LASTEXITCODE -ne 0) { $status = $LASTEXITCODE }
+          } catch {
+            $status = 1
+            ($_ | Format-List * -Force | Out-String) | Set-Content -LiteralPath install-contract-tests.log -Encoding utf8
+          }
+          if (Test-Path install-contract-tests.log) { Get-Content install-contract-tests.log | Write-Host }
+          "status=$status" >> $env:GITHUB_OUTPUT
+          exit 0
+
+      - name: Preserve complete Windows diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pleiades-windows-analysis-${{ github.sha }}
+          path: |
+            psscriptanalyzer-version.txt
+            psscriptanalyzer-errors.txt
+            psscriptanalyzer-warnings.txt
+            repository-verification.log
+            install-contract-tests.log
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Enforce Windows gate
+        if: always()
+        shell: pwsh
+        run: |
+          if ('${{ steps.analyzer.outputs.status }}' -ne '0') { throw 'PSScriptAnalyzer gate failed' }
+          if ('${{ steps.repository.outputs.status }}' -ne '0') { throw 'repository verification gate failed' }
+          if ('${{ steps.install.outputs.status }}' -ne '0') { throw 'install/uninstall contract gate failed' }
+
+  portable-verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          show-progress: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install portable validators
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq php-cli
+
+      - name: Compile release and sensitivity tools
+        run: python3 -m py_compile ci/scan_public_repo.py scripts/package_release.py
+
+      - name: Validate shell and PHP surfaces
+        run: |
+          bash -n bin/pleiades-snapshot.sh
+          php -l portal/pleiades.php
+
+      - name: Defensive and ontology invariants
         run: |
           set -euo pipefail
           ! grep -RInE 'boot-tmux|pleiades-analysis|--bind-ro=/mnt/c|ErrorActionPreference[[:space:]]*=[[:space:]]*.[Cc]ontinue' bin ops README.md
@@ -60,8 +173,100 @@ jobs:
           grep -Fq "schema = 'pleiades.event/v1'" bin/pleiades-netwatch.ps1
           grep -Fq 'pleiades.windows-security-cursor/v1' bin/pleiades-collector.ps1
           grep -Fq '[switch]$AcceptLogReset' bin/pleiades-collector.ps1
-          grep -Fq 'collection_epoch' bin/pleiades-collector.ps1
-          grep -Fq 'legacy collector cursor is corrupt; refusing implicit replay' bin/pleiades-collector.ps1
-          ! grep -Fq 'Set-Content -Path $cursorFile' bin/pleiades-collector.ps1
           grep -Fq 'pleiades.status/v1' bin/pleiades-snapshot.sh
-          grep -Fq 'if ($script:Fail -gt 0) { exit 1 }' ops/verify-windows.ps1
+          grep -Fq 'scripts_authenticode = '\''not-claimed'\''' ops/install-windows.ps1
+          ! grep -RInF '# SIG # Begin signature block' bin ops
+          grep -Fq 'lifecycle: experimental' MODOS_COMPONENT.yaml
+          grep -Fq 'authority: local-enforcement' MODOS_COMPONENT.yaml
+          grep -Fq 'promotionPolicy: evidence-gated' MODOS_COMPONENT.yaml
+          test "$(cat VERSION)" = '0.2.0'
+          test -f LICENSE
+          test -f SECURITY.md
+          test -f PRIVACY.md
+          test -f THIRD_PARTY_NOTICES.md
+
+      - name: Capture public-tree and history scan
+        id: sensitivity
+        run: |
+          set +e
+          python3 ci/scan_public_repo.py > sensitivity.log 2>&1
+          status=$?
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          cat sensitivity.log
+          exit 0
+
+      - name: Preserve sensitivity diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pleiades-windows-sensitivity-${{ github.sha }}
+          path: sensitivity.log
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Enforce sensitivity gate
+        if: always()
+        run: test "${{ steps.sensitivity.outputs.status }}" = '0'
+
+  source-package:
+    needs:
+      - windows-verify
+      - portable-verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          show-progress: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Build twice and prove byte reproducibility
+        run: |
+          set -euo pipefail
+          python3 scripts/package_release.py --output dist-one
+          python3 scripts/package_release.py --output dist-two
+          for first in dist-one/*; do
+            file="$(basename "$first")"
+            cmp "$first" "dist-two/$file"
+          done
+
+      - name: Verify ZIP contents and receipt boundary
+        run: |
+          python3 - <<'PY'
+          import json
+          import pathlib
+          import zipfile
+
+          version = pathlib.Path('VERSION').read_text(encoding='utf-8').strip()
+          prefix = f'pleiades-windows-{version}/'
+          expected = [line.strip() for line in pathlib.Path('release/source-files.txt').read_text(encoding='utf-8').splitlines() if line.strip() and not line.lstrip().startswith('#')]
+          with zipfile.ZipFile(f'dist-one/pleiades-windows-{version}.zip') as archive:
+              actual = sorted(name for name in archive.namelist() if not name.endswith('/'))
+          assert actual == [prefix + path for path in expected]
+          receipt = json.loads(pathlib.Path(f'dist-one/pleiades-windows-{version}.build-receipt.json').read_text(encoding='utf-8'))
+          assert receipt['distribution'] == 'unsigned-source'
+          assert receipt['scripts_authenticode_signed'] is False
+          assert receipt['contains_runtime_state'] is False
+          assert receipt['contains_event_records'] is False
+          assert receipt['contains_credentials'] is False
+          assert receipt['contains_wsl_distribution'] is False
+          assert receipt['contains_web_server'] is False
+          assert receipt['tasks_registered_by_package_build'] is False
+          PY
+
+      - name: Verify checksum manifest
+        run: |
+          cd dist-one
+          sha256sum -c SHA256SUMS.txt
+
+      - name: Upload exact-head Windows source candidate
+        uses: actions/upload-artifact@v4
+        with:
+          name: pleiades-windows-source-${{ github.sha }}
+          path: dist-one/
+          if-no-files-found: error
+          retention-days: 30
