@@ -8,10 +8,11 @@ Release publication authority: tag-only draft workflow; no tag or release author
 
 ## Last reviewed heads and receipts
 
-- Last fully validated implementation head before this update: `a6b02c280eaf6a8a0a328f1be07158ebddce8707`
-- Exact CI run: `29690860645`
+- Last fully validated implementation head before workflow hardening: `a6b02c280eaf6a8a0a328f1be07158ebddce8707`
+- Earlier exact CI run: `29690860645`
 - Workflow hardening head: `238825d3b88240b4e887903babe9c31c2813fe40`
-- Current ledger head: pending this commit
+- Fully validated workflow-and-ledger head: `e1c006b7718cd789ceb94379b5784c79bf4ffe49`
+- Exact workflow-and-ledger CI run: `29864465739`
 
 ## Completed scope
 
@@ -32,7 +33,9 @@ Release publication authority: tag-only draft workflow; no tag or release author
 
 ## Validation receipts
 
-At exact head `a6b02c280eaf6a8a0a328f1be07158ebddce8707`, CI run `29690860645` passed.
+At exact head `a6b02c280eaf6a8a0a328f1be07158ebddce8707`, CI run `29690860645` passed the original implementation validation.
+
+At exact head `e1c006b7718cd789ceb94379b5784c79bf4ffe49`, CI run `29864465739` passed after workflow hardening and ledger creation.
 
 The validated scope included:
 
@@ -45,9 +48,10 @@ The validated scope included:
 - two deterministic builds of the same exact head;
 - byte-for-byte ZIP comparison;
 - exact ZIP-manifest and receipt assertions;
-- candidate artifact upload.
+- candidate artifact upload;
+- immutable Action pins, explicit runner identity, disabled persisted checkout credentials, and tag-to-main ancestry checks.
 
-The current workflow and ledger commits require a fresh exact-head CI receipt. No release workflow was executed because doing so would require an unauthorized tag and public release.
+Changed conclusion: the ordinary source and workflow checkpoint is green at the complete recorded head. No release workflow was executed because doing so would require an unauthorized tag and public release.
 
 ## External practices applied
 
@@ -95,4 +99,4 @@ Reprocess this repository only when one or more of the following changes:
 
 ## Next action
 
-Inspect CI for the workflow-and-ledger head. If it passes, skip ordinary source reprocessing and move to the disposable Windows runtime fixture and task-registration evidence. Keep the repository on `HOLD` until stacked integration and a separately authorized prerelease validate the real public distribution path.
+Skip ordinary source reprocessing until a trigger changes. The next substantive checkpoint is the disposable Windows runtime fixture and scheduled-task evidence, followed by dependency-order integration and one separately authorized prerelease. Keep the repository on `HOLD` until those gates are satisfied.
